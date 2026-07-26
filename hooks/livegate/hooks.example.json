@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      {
+        "command": "./hooks/livegate/livegate.py",
+        "matcher": "Shell",
+        "failClosed": false,
+        "timeout": 5
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "./hooks/livegate/livegate.py",
+        "failClosed": true,
+        "timeout": 5
+      }
+    ]
+  }
+}
