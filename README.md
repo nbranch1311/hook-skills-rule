@@ -7,7 +7,7 @@ verified: 2026-07-26
 
 Agents are expensive to train and already smart, but they still need direction,
 rules, and boundaries. Rules create order, hooks make agents predictable, and
-skills expand what they can do.
+skills make what they can do repeatable.
 
 This repository is a collection of reusable AI-agent tooling, organized by
 type.
