@@ -8,6 +8,7 @@ runtime details, not application identities.
 
 - Cursor with Agent hooks support
 - Python 3.10 or newer
+- macOS with `lsof`, or Linux with `ss`
 
 ## Install
 
@@ -85,11 +86,17 @@ The version 2 state contains:
   application as `starting`.
 - Another mapped command for that application is denied while it is starting.
 - A loopback HTTP(S) URL advertised by successful shell output is verified and
-  recorded as `live`.
+  attributed to the agent process before it is recorded as `live`.
+- If no URL is advertised, a new attributed HTTP listener is used as fallback.
+- A short-lived observer waits up to `startupTimeoutSeconds` (60 by default)
+  without supervising or terminating the server.
 - A verified live application denies later equivalent commands and reports its
   existing URL.
+- Live instances are revalidated after agent events using their PID, process
+  start identity, and endpoint. Stale instances are removed.
 - Unknown commands are allowed.
-- A failed mapped shell command releases its reservation.
+- A failed command or startup timeout releases its reservation and stores a
+  short redacted reason. Shell outcome remains separate from server health.
 
 Cursor hook `permission: "ask"` is unreliable today, so LiveGate uses `deny`
 for duplicate starts.
@@ -101,6 +108,7 @@ Add an optional committed `livegate.json` at the workspace root:
 ```json
 {
   "version": 1,
+  "startupTimeoutSeconds": 60,
   "applications": [
     {
       "id": "docs",
