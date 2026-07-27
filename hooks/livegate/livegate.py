@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
 try:
@@ -36,6 +36,14 @@ LOCAL_URL = re.compile(
 )
 ENVIRONMENT_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 OUTPUT_ASSIGNMENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
+SENSITIVE_FLAG = re.compile(r"(?i)^--?(?:api-)?(?:token|key|secret|password|authorization)$")
+SENSITIVE_INLINE = re.compile(
+    r"(?i)^(--?(?:api-)?(?:token|key|secret|password|authorization))=(.+)$"
+)
+SENSITIVE_QUERY = re.compile(
+    r"(?i)([?&](?:api_?)?(?:token|key|secret|password|authorization)=)[^&\s]+"
+)
+BEARER = re.compile(r"(?i)\bBearer\s+\S+")
 
 
 def now() -> str:
@@ -156,14 +164,27 @@ def display_command(command: str) -> str:
         tokens = shlex.split(command)
     except ValueError:
         return "<unparseable command>"
-    return shlex.join(
-        [
-            f"{token.split('=', 1)[0]}=<redacted>"
-            if ENVIRONMENT_ASSIGNMENT.match(token)
-            else token
-            for token in tokens
-        ]
-    )
+    redacted: list[str] = []
+    hide_next = False
+    for token in tokens:
+        inline = SENSITIVE_INLINE.match(token)
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+        elif ENVIRONMENT_ASSIGNMENT.match(token):
+            redacted.append(f"{token.split('=', 1)[0]}=<redacted>")
+        elif inline:
+            redacted.append(f"{inline.group(1)}=<redacted>")
+        else:
+            redacted.append(SENSITIVE_QUERY.sub(r"\1<redacted>", token))
+            hide_next = bool(SENSITIVE_FLAG.match(token))
+    return redact_text(shlex.join(redacted))
+
+
+def redact_text(value: str) -> str:
+    value = OUTPUT_ASSIGNMENT.sub(r"\1=<redacted>", value)
+    value = SENSITIVE_QUERY.sub(r"\1<redacted>", value)
+    return BEARER.sub("Bearer <redacted>", value)
 
 
 def command_hash(command: str) -> str:
@@ -489,6 +510,21 @@ def process_fingerprint(pid: int) -> str | None:
     return hashlib.sha256(command.strip()).hexdigest() if command.strip() else None
 
 
+def process_group(pid: int) -> int | None:
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pgid=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return int(value) if value.isdigit() else None
+
+
 def listener_snapshot() -> dict[str, dict[str, Any]]:
     return {
         str(port): {"pid": pid}
@@ -539,7 +575,10 @@ def advertised_urls(value: Any) -> list[str]:
         return [url for item in value for url in advertised_urls(item)]
     if not isinstance(value, str):
         return []
-    return [match.group(0).rstrip(".,);") for match in LOCAL_URL.finditer(value)]
+    return [
+        urlunsplit((*urlsplit(match.group(0).rstrip(".,);"))[:3], "", ""))
+        for match in LOCAL_URL.finditer(value)
+    ]
 
 
 def hook_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -564,10 +603,7 @@ def diagnostic(result: dict[str, Any]) -> str | None:
     text = result.get("stderr") or result.get("message")
     if not text:
         return None
-    return OUTPUT_ASSIGNMENT.sub(
-        r"\1=<redacted>",
-        " ".join(str(text).split()),
-    )[-300:]
+    return redact_text(" ".join(str(text).split()))[-300:]
 
 
 def listener_for_url(url: str) -> tuple[int, dict[str, Any]] | None:
@@ -589,6 +625,10 @@ def attributed_advertised(
     application: dict[str, Any],
 ) -> list[tuple[int, str, dict[str, Any]]]:
     baseline = application.get("listenersBefore", {})
+    shell_pid = application.get("shellPid")
+    shell_pgid = application.get("shellPgid")
+    if not shell_pid:
+        return []
     candidates: list[tuple[int, str, dict[str, Any]]] = []
     for index, url in enumerate(application.get("advertisedUrls", [])):
         listener = listener_for_url(url)
@@ -599,6 +639,13 @@ def attributed_advertised(
             baseline.get(str(port), {}).get("pid") != identity["pid"]
             and identity.get("started")
             and identity.get("fingerprint")
+            and (
+                is_descendant(identity["pid"], int(shell_pid))
+                or (
+                    shell_pgid
+                    and process_group(identity["pid"]) == int(shell_pgid)
+                )
+            )
         ):
             candidates.append((index, url, identity))
     return candidates
@@ -671,26 +718,34 @@ def observe_once(workspace: Path, application_id: str, attempt_id: str) -> bool:
         if not current or current.get("attemptId") != attempt_id:
             return False
         application = dict(current)
-    candidate = attributed_candidate(application)
-    if not candidate:
+    advertised = attributed_advertised(application)
+    if advertised:
+        candidates = [(url, identity) for _, url, identity in advertised]
+    else:
+        fallback = attributed_candidate(application)
+        candidates = [fallback] if fallback else []
+    if not candidates:
         return False
-    url, identity = candidate
     with state_lock(workspace):
         state = load_state(workspace)
         current = state["applications"].get(application_id)
         if not current or current.get("attemptId") != attempt_id:
             return False
-        instance = {
-            "pid": identity["pid"],
-            "processFingerprint": identity["fingerprint"],
-            "processStarted": identity["started"],
-            "shellPid": current.get("shellPid"),
-            "since": now(),
-            "url": url,
-        }
         instances = current.setdefault("instances", [])
-        if not any(existing["url"] == url for existing in instances):
-            instances.append(instance)
+        for url, identity in candidates:
+            if any(existing["url"] == url for existing in instances):
+                continue
+            instances.append(
+                {
+                    "attemptId": attempt_id,
+                    "pid": identity["pid"],
+                    "processFingerprint": identity["fingerprint"],
+                    "processStarted": identity["started"],
+                    "shellPid": current.get("shellPid"),
+                    "since": now(),
+                    "url": url,
+                }
+            )
         current["state"] = "live"
         attempt = find_attempt(state, attempt_id)
         if attempt:
@@ -764,7 +819,6 @@ def instance_healthy(instance: dict[str, Any], listeners: dict[int, int]) -> boo
         and pid == instance.get("pid")
         and process_started(pid) == instance.get("processStarted")
         and process_fingerprint(pid) == instance.get("processFingerprint")
-        and endpoint_open(instance["url"])
     )
 
 
@@ -1066,6 +1120,11 @@ def handle_group_before(
     listeners_before = listener_snapshot()
     with state_lock(workspace):
         state = load_state(workspace)
+        state["approvals"] = {
+            token: approval
+            for token, approval in state["approvals"].items()
+            if approval.get("expiresAt", 0) > time.time()
+        }
         current = state["groups"].get(group_spec["id"])
         requested = requested_second(command)
         approval = state["approvals"].pop(requested, None) if requested else None
@@ -1286,6 +1345,7 @@ def handle_group_post(
         current["advertisedUrls"] = advertised_urls(result)
         if isinstance(result.get("pid"), int):
             current["shellPid"] = result["pid"]
+            current["shellPgid"] = process_group(result["pid"]) or result["pid"]
         attempt = find_attempt(state, attempt_id)
         if attempt:
             attempt["shell"] = {
@@ -1294,13 +1354,12 @@ def handle_group_post(
                 if result.get(key) is not None
             }
         save_state(workspace, state)
-    if not observe_group(workspace, group_spec["id"], attempt_id):
-        launch_group_observer(
-            workspace,
-            group_spec["id"],
-            attempt_id,
-            startup_timeout(workspace),
-        )
+    launch_group_observer(
+        workspace,
+        group_spec["id"],
+        attempt_id,
+        startup_timeout(workspace),
+    )
 
 
 def duplicate_result(
@@ -1475,6 +1534,7 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
         current["advertisedUrls"] = advertised_urls(result)
         if isinstance(result.get("pid"), int):
             current["shellPid"] = result["pid"]
+            current["shellPgid"] = process_group(result["pid"]) or result["pid"]
         if reason := diagnostic(result):
             current["failureReason"] = reason
         attempt = find_attempt(state, attempt_id)
@@ -1486,8 +1546,6 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
             }
         save_state(workspace, state)
 
-    if observe_once(workspace, application["id"], attempt_id):
-        return
     launch_observer(
         workspace,
         application["id"],
@@ -1500,12 +1558,20 @@ def main() -> int:
     try:
         if len(sys.argv) == 6:
             observer = observe_group_until if sys.argv[1] == "--observe-group" else observe
-            return observer(
-                Path(sys.argv[2]),
-                sys.argv[3],
-                sys.argv[4],
-                int(sys.argv[5]),
-            )
+            timeout = int(sys.argv[5])
+            deadline = time.monotonic() + timeout + 1
+            while True:
+                try:
+                    return observer(
+                        Path(sys.argv[2]),
+                        sys.argv[3],
+                        sys.argv[4],
+                        max(1, int(deadline - time.monotonic())),
+                    )
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
 
         payload = json.loads(sys.stdin.read() or "{}")
         if payload.get("hook_event_name") == "beforeShellExecution":

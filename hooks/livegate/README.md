@@ -136,6 +136,9 @@ Routine successful starts and health checks are quiet. Duplicate decisions,
 failed launches, and explicit exception flows return concise feedback. Internal
 errors, unavailable inspection tools, lock contention, unsupported platforms,
 and inspection timeouts fail open; only a verified duplicate is denied.
+Stored commands and diagnostics redact environment values, credential flags,
+Bearer values, and sensitive URL queries; advertised endpoint queries are not
+persisted.
 
 LiveGate observes agent Shell events only. It ignores commands and processes
 started manually by users. It never launches, stops, restarts, supervises, or

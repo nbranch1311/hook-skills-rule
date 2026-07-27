@@ -10,12 +10,14 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer as StandardHTTPServer
 from pathlib import Path
+from typing import Callable
 from unittest.mock import patch
 
 from livegate import (
     approval_matches,
+    advertised_urls,
     command_cwd,
     inferred_application,
     inspection_command,
@@ -64,6 +66,12 @@ class HealthyHandler(BaseHTTPRequestHandler):
         pass
 
 
+class HTTPServer(StandardHTTPServer):
+    def shutdown(self) -> None:
+        super().shutdown()
+        self.server_close()
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp).resolve()
@@ -97,12 +105,20 @@ def main() -> int:
                             "commands": ["pnpm preexisting"],
                         },
                         {
+                            "id": "concurrent-user",
+                            "commands": ["pnpm concurrent-user"],
+                        },
+                        {
                             "id": "fallback",
                             "commands": ["pnpm fallback"],
                         },
                         {
                             "id": "timeout",
                             "commands": ["pnpm timeout"],
+                        },
+                        {
+                            "id": "multi-endpoint-app",
+                            "commands": ["pnpm multi-endpoint"],
                         },
                         {
                             "id": "stack-ui",
@@ -186,7 +202,43 @@ def main() -> int:
                 }
             )
 
+        def wait_for(predicate: Callable[[], bool], timeout: float = 4) -> None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                time.sleep(0.05)
+            raise AssertionError("timed out waiting for observer")
+
+        def application_is(application_id: str, expected: str) -> bool:
+            try:
+                state = json.loads(state_path.read_text())
+                return state["applications"][application_id]["state"] == expected
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                return False
+
+        def application_has_instances(application_id: str, count: int) -> bool:
+            try:
+                state = json.loads(state_path.read_text())
+                return len(state["applications"][application_id]["instances"]) == count
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                return False
+
+        def configured_group_is(expected: str) -> bool:
+            try:
+                state = json.loads(state_path.read_text())
+                return any(
+                    group.get("applicationIds") == ["stack-ui", "stack-api"]
+                    and group.get("state") == expected
+                    for group in state["groups"].values()
+                )
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                return False
+
         assert inspection_command("Windows") is None
+        assert advertised_urls(
+            "Local: http://localhost:5173/path?token=query-secret"
+        ) == ["http://localhost:5173/path"]
         real_run = subprocess.run
 
         def time_out_inspection(
@@ -239,13 +291,20 @@ def main() -> int:
         elapsed = time.perf_counter() - started
         assert elapsed < 0.2, elapsed
 
-        assert before("./privacy-check") == {"permission": "allow"}
+        privacy_command = (
+            "./privacy-check --token raw-cli "
+            "'http://localhost/path?token=query-secret'"
+        )
+        assert before(privacy_command) == {"permission": "allow"}
+        assert "raw-cli" not in state_path.read_text()
+        assert "query-secret" not in state_path.read_text()
         assert post(
-            "./privacy-check",
-            "API_TOKEN=raw-secret FULL_OUTPUT_MARKER",
+            privacy_command,
+            "API_TOKEN=raw-secret FULL_OUTPUT_MARKER Bearer bearer-secret",
         ) == {}
         persisted = state_path.read_text()
         assert "raw-secret" not in persisted
+        assert "bearer-secret" not in persisted
         assert "FULL_OUTPUT_MARKER" not in persisted
 
         assert parse_lsof("p41\nn127.0.0.1:5173\np42\nn[::1]:6006\n") == {
@@ -400,7 +459,7 @@ def main() -> int:
                 pid=os.getpid(),
             ) == {}
             stack_api_thread.start()
-            time.sleep(2)
+            wait_for(lambda: configured_group_is("live"))
             state = json.loads(state_path.read_text())
             configured_group_id = next(
                 group_id
@@ -449,6 +508,7 @@ def main() -> int:
                     f"UI: {second_ui_url}\nAPI: {second_api_url}",
                     pid=os.getpid(),
                 ) == {}
+                wait_for(lambda: configured_group_is("live"))
                 state = json.loads(state_path.read_text())
                 assert {
                     member["url"]
@@ -488,6 +548,11 @@ def main() -> int:
                 f"{multi_a_url}\n{multi_b_url}",
                 pid=os.getpid(),
             ) == {}
+            wait_for(
+                lambda: bool(
+                    json.loads(state_path.read_text()).get("learnedGroups")
+                )
+            )
             state = json.loads(state_path.read_text())
             assert state["learnedGroups"]
             fallback_group_id = next(iter(state["learnedGroups"].values()))["id"]
@@ -499,7 +564,8 @@ def main() -> int:
             multi_a_thread.join()
             multi_b_thread.join()
 
-        assert before("pnpm build") == {"permission": "allow"}
+        post_group_build = before("pnpm build")
+        assert post_group_build["permission"] == "allow"
         race_results: list[dict[str, object]] = []
         racers = [
             threading.Thread(target=lambda: race_results.append(before("pnpm race")))
@@ -532,6 +598,7 @@ def main() -> int:
         try:
             url = f"http://127.0.0.1:{server.server_port}/"
             assert post("pnpm dev", f"Local: {url}", exit_code=1, pid=os.getpid()) == {}
+            wait_for(lambda: application_is("docs", "live"))
             state = json.loads(state_path.read_text())
             assert state["applications"]["docs"]["state"] == "live"
             assert state["applications"]["docs"]["instances"][0]["url"] == url
@@ -575,6 +642,7 @@ def main() -> int:
                     f"Local: {second_url}",
                     pid=os.getpid(),
                 ) == {}
+                wait_for(lambda: application_has_instances("docs", 2))
                 state = json.loads(state_path.read_text())
                 assert [instance["url"] for instance in state["applications"]["docs"]["instances"]] == [
                     url,
@@ -635,12 +703,31 @@ def main() -> int:
             preexisting.shutdown()
             thread.join()
 
+        assert before("pnpm concurrent-user") == {"permission": "allow"}
+        concurrent_user = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        thread = threading.Thread(target=concurrent_user.serve_forever)
+        thread.start()
+        try:
+            concurrent_url = f"http://127.0.0.1:{concurrent_user.server_port}/"
+            assert post(
+                "pnpm concurrent-user",
+                f"Local: {concurrent_url}",
+                pid=1,
+            ) == {}
+            time.sleep(0.3)
+            state = json.loads(state_path.read_text())
+            assert state["applications"]["concurrent-user"]["state"] == "starting"
+        finally:
+            concurrent_user.shutdown()
+            thread.join()
+
         assert before("pnpm fallback") == {"permission": "allow"}
         fallback = HTTPServer(("127.0.0.1", 0), HealthyHandler)
         thread = threading.Thread(target=fallback.serve_forever)
         thread.start()
         try:
             assert post("pnpm fallback", "ready", pid=os.getpid()) == {}
+            wait_for(lambda: application_is("fallback", "live"))
             state = json.loads(state_path.read_text())
             assert state["applications"]["fallback"]["state"] == "live"
             assert state["applications"]["fallback"]["instances"][0]["url"].endswith(
@@ -649,6 +736,36 @@ def main() -> int:
         finally:
             fallback.shutdown()
             thread.join()
+
+        assert before("pnpm multi-endpoint") == {"permission": "allow"}
+        endpoint_a = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        endpoint_b = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        endpoint_a_thread = threading.Thread(target=endpoint_a.serve_forever)
+        endpoint_b_thread = threading.Thread(target=endpoint_b.serve_forever)
+        endpoint_a_thread.start()
+        endpoint_b_thread.start()
+        try:
+            endpoint_a_url = f"http://127.0.0.1:{endpoint_a.server_port}/"
+            endpoint_b_url = f"http://127.0.0.1:{endpoint_b.server_port}/"
+            assert post(
+                "pnpm multi-endpoint",
+                f"{endpoint_a_url}\n{endpoint_b_url}",
+                pid=os.getpid(),
+            ) == {}
+            wait_for(lambda: application_is("multi-endpoint-app", "live"))
+            state = json.loads(state_path.read_text())
+            assert {
+                instance["url"]
+                for instance in state["applications"]["multi-endpoint-app"]["instances"]
+            } == {endpoint_a_url, endpoint_b_url}
+            endpoint_duplicate = before("pnpm multi-endpoint")
+            assert endpoint_a_url in endpoint_duplicate["user_message"]
+            assert endpoint_b_url in endpoint_duplicate["user_message"]
+        finally:
+            endpoint_a.shutdown()
+            endpoint_b.shutdown()
+            endpoint_a_thread.join()
+            endpoint_b_thread.join()
 
         assert before("./serve-local") == {"permission": "allow"}
         learned = HTTPServer(("127.0.0.1", 0), HealthyHandler)
@@ -661,6 +778,9 @@ def main() -> int:
                 f"Local: {learned_url}",
                 pid=os.getpid(),
             ) == {}
+            wait_for(
+                lambda: bool(json.loads(state_path.read_text()).get("learned"))
+            )
             assert before("./serve-local")["permission"] == "deny"
             state = json.loads(state_path.read_text())
             assert state["learned"]
@@ -704,7 +824,10 @@ def main() -> int:
             "pnpm --filter @scope/mapped run dev",
             "",
             exit_code=1,
-            error="API_TOKEN=secret DATABASE_PASSWORD=hunter2 ACCOUNT=private crash",
+            error=(
+                "API_TOKEN=secret DATABASE_PASSWORD=hunter2 ACCOUNT=private "
+                "Bearer bearer-secret https://localhost/?token=query-secret crash"
+            ),
         ) == {}
         time.sleep(2.5)
         state = json.loads(state_path.read_text())
@@ -712,11 +835,17 @@ def main() -> int:
         assert state["attempts"][-1]["state"] == "failed"
         assert (
             state["attempts"][-1]["reason"]
-            == "API_TOKEN=<redacted> DATABASE_PASSWORD=<redacted> ACCOUNT=<redacted> crash"
+            == (
+                "API_TOKEN=<redacted> DATABASE_PASSWORD=<redacted> "
+                "ACCOUNT=<redacted> Bearer <redacted> "
+                "https://localhost/?token=<redacted> crash"
+            )
         )
         failure_notice = before("pnpm build", session="failure-session")
         assert "ACCOUNT=<redacted>" in failure_notice["agent_message"]
         assert "private" not in failure_notice["agent_message"]
+        assert "bearer-secret" not in failure_notice["agent_message"]
+        assert "query-secret" not in failure_notice["agent_message"]
         assert before("pnpm build", session="failure-session") == {"permission": "allow"}
 
         state["attempts"] = [
