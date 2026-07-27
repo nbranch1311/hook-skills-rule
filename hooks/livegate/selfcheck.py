@@ -3,145 +3,161 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from livegate import (
-    begin_probe,
-    finish_probe,
-    handle_before_shell,
-    handle_post_tool,
-    load_config,
-    load_state,
-    port_open,
-    probe,
-    remove_server,
-    set_live,
-    start_recipe,
-)
+HOOK = Path(__file__).with_name("livegate.py")
+
+
+def run_hook(payload: dict[str, object]) -> dict[str, object]:
+    result = subprocess.run(
+        [sys.executable, "-B", str(HOOK)],
+        input=json.dumps(payload),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+class HealthyHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
 
 
 def main() -> int:
-    config = load_config()
-    dev = start_recipe("pnpm dev", config)
-    storybook = start_recipe("pnpm --filter docs storybook:app", config)
-    assert dev and dev["id"] == "dev"
-    assert storybook and storybook["id"] == "storybook"
-    assert start_recipe("pnpm build", config) is None
-
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp).resolve()
         (workspace / ".git").mkdir()
         (workspace / ".gitignore").write_text("existing-entry\n")
-        token = begin_probe(workspace, "dev", 65530)
-        assert finish_probe(workspace, dev, 65530, token, "failed", "test failure")
-        gitignore = (workspace / ".gitignore").read_bytes()
-        assert b"/.livegate/" in gitignore
-        assert not (workspace / ".livegate" / "events.log").exists()
-        assert load_state(workspace)["servers"]["dev"]["state"] == "failed"
-
-        set_live(workspace, dev, 65530)
-        assert (workspace / ".gitignore").read_bytes() == gitignore
-        assert load_state(workspace)["servers"]["dev"]["state"] == "live"
-        remove_server(workspace, "dev")
-        assert load_state(workspace)["servers"] == {}
-
-        def fail(recipe: dict[str, object], port: int) -> None:
-            token = begin_probe(workspace, str(recipe["id"]), port)
-            finish_probe(workspace, recipe, port, token, "failed", "failed")
-
-        threads = [
-            threading.Thread(target=fail, args=(recipe, 65000 + index))
-            for index, recipe in enumerate((dev, storybook))
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        assert set(load_state(workspace)["servers"]) == {"dev", "storybook"}
-
-        handle_post_tool(
-            {
-                "hook_event_name": "postToolUse",
-                "tool_input": {"command": "pkill device-manager"},
-                "tool_output": '{"exitCode":0}',
-                "workspace_roots": [str(workspace)],
-            }
-        )
-        assert "dev" in load_state(workspace)["servers"]
-
-        assert (
-            handle_before_shell(
+        (workspace / "livegate.json").write_text(
+            json.dumps(
                 {
-                    "hook_event_name": "beforeShellExecution",
-                    "command": "pnpm storybook:stop",
-                    "workspace_roots": [str(workspace)],
+                    "version": 1,
+                    "applications": [
+                        {
+                            "id": "docs",
+                            "name": "Documentation",
+                            "commands": ["pnpm dev", "pnpm run docs"],
+                        },
+                        {
+                            "id": "filtered-docs",
+                            "packageScripts": ["@scope/docs:dev"],
+                        },
+                        {
+                            "id": "race",
+                            "commands": ["pnpm race"],
+                        },
+                        {
+                            "id": "raw-socket",
+                            "commands": ["pnpm raw"],
+                        },
+                    ],
                 }
-            )["permission"]
-            == "allow"
+            )
         )
-        handle_post_tool(
+        state_path = workspace / ".livegate" / "servers.json"
+        state_path.parent.mkdir()
+        state_path.write_text(json.dumps({"version": 1, "servers": {"legacy": {}}}))
+
+        before = lambda command: run_hook(
             {
-                "hook_event_name": "postToolUse",
-                "tool_input": {"command": "pnpm storybook:stop"},
-                "tool_output": '{"exitCode":0}',
+                "hook_event_name": "beforeShellExecution",
+                "command": command,
                 "workspace_roots": [str(workspace)],
             }
         )
-        assert "storybook" not in load_state(workspace)["servers"]
-
-        handle_post_tool(
+        post = lambda command, output, exit_code=0: run_hook(
             {
                 "hook_event_name": "postToolUse",
-                "tool_input": {"command": "pnpm dev"},
-                "tool_output": '{"exitCode":0}',
+                "tool_input": {"command": command},
+                "tool_output": {
+                    "exitCode": exit_code,
+                    "stdout": output,
+                },
                 "workspace_roots": [str(workspace)],
             }
         )
-        assert "dev" in load_state(workspace)["servers"]
 
-        handle_post_tool(
-            {
-                "hook_event_name": "postToolUse",
-                "tool_input": {"command": "kill-port 15173"},
-                "tool_output": '{"exitCode":0}',
-                "workspace_roots": [str(workspace)],
-            }
-        )
-        assert "dev" in load_state(workspace)["servers"]
+        assert before("pnpm build") == {"permission": "allow"}
+        race_results: list[dict[str, object]] = []
+        racers = [
+            threading.Thread(target=lambda: race_results.append(before("pnpm race")))
+            for _ in range(2)
+        ]
+        for racer in racers:
+            racer.start()
+        for racer in racers:
+            racer.join()
+        assert sorted(result["permission"] for result in race_results) == ["allow", "deny"]
+        state = json.loads(state_path.read_text())
+        state["applications"]["race"]["reservedUntil"] = 0
+        state_path.write_text(json.dumps(state))
+        assert before("pnpm race") == {"permission": "allow"}
 
-        begin_probe(workspace, "dev", 5173)
-        handle_post_tool(
-            {
-                "hook_event_name": "postToolUse",
-                "tool_input": {"command": "pnpm dev"},
-                "tool_output": json.dumps({"exitCode": 1, "stderr": "server crashed"}),
-                "workspace_roots": [str(workspace)],
-            }
-        )
-        assert load_state(workspace)["servers"]["dev"]["reason"] == "server crashed"
+        assert before("API_TOKEN=secret pnpm dev") == {"permission": "allow"}
+        state = json.loads(state_path.read_text())
+        assert state["version"] == 2
+        assert state["applications"]["docs"]["state"] == "starting"
+        assert "secret" not in state_path.read_text()
+        assert "/.livegate/" in (workspace / ".gitignore").read_text().splitlines()
 
-        remove_server(workspace, "dev")
-        token = begin_probe(workspace, "dev", 65530)
-        handle_post_tool(
-            {
-                "hook_event_name": "postToolUse",
-                "tool_input": {"command": "kill-port 65530"},
-                "tool_output": '{"exitCode":0}',
-                "workspace_roots": [str(workspace)],
-            }
-        )
-        probe(workspace, "dev", 65530, 0, token)
-        assert "dev" not in load_state(workspace)["servers"]
+        duplicate = before("pnpm run docs")
+        assert duplicate["permission"] == "deny"
+        assert "already starting" in duplicate["user_message"]
 
-    listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    try:
-        listener.bind(("::1", 0))
+        server = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/"
+            assert post("pnpm dev", f"Local: {url}") == {}
+            state = json.loads(state_path.read_text())
+            assert state["applications"]["docs"]["state"] == "live"
+            assert state["applications"]["docs"]["url"] == url
+            duplicate = before("pnpm run docs")
+            assert duplicate["permission"] == "deny"
+            assert url in duplicate["user_message"]
+        finally:
+            server.shutdown()
+            thread.join()
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
         listener.listen()
-        assert port_open(listener.getsockname()[1])
-    finally:
-        listener.close()
+        try:
+            assert before("pnpm raw") == {"permission": "allow"}
+            raw_url = f"http://127.0.0.1:{listener.getsockname()[1]}/"
+            assert post("pnpm raw", f"Local: {raw_url}") == {}
+            state = json.loads(state_path.read_text())
+            assert state["applications"]["raw-socket"]["state"] == "starting"
+        finally:
+            listener.close()
+
+        assert before("pnpm --filter @scope/docs run dev") == {"permission": "allow"}
+        state = json.loads(state_path.read_text())
+        assert state["applications"]["filtered-docs"]["state"] == "starting"
+        assert post("pnpm --filter @scope/docs run dev", "", exit_code=1) == {}
+        state = json.loads(state_path.read_text())
+        assert "filtered-docs" not in state["applications"]
+        assert state["attempts"][-1]["state"] == "failed"
+
+        state["attempts"] = [
+            {"id": str(index), "state": "failed"} for index in range(50)
+        ]
+        state_path.write_text(json.dumps(state))
+        assert before("pnpm --filter @scope/docs run dev") == {"permission": "allow"}
+        state = json.loads(state_path.read_text())
+        assert len(state["attempts"]) == 50
+        assert state["attempts"][0]["id"] == "1"
 
     print("LiveGate self-check passed.")
     return 0
