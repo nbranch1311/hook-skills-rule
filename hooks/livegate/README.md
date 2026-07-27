@@ -52,7 +52,8 @@ chmod +x ~/.cursor/hooks/livegate/livegate.py ~/.cursor/hooks/livegate/selfcheck
 ```
 
 No command matcher is used: LiveGate reads optional application mappings from
-the current workspace.
+the current workspace, resolves common JavaScript package scripts, and learns
+strongly attributed custom commands.
 
 4. Validate the installation:
 
@@ -122,6 +123,14 @@ Add an optional committed `livegate.json` at the workspace root:
 
 Commands are normalized exact aliases. Package-script identities use
 `<package>:<script>`; `.` identifies the workspace root. No port is configured.
+Mappings override automatic inference.
+
+Without a mapping, LiveGate resolves npm, pnpm, yarn, and bun scripts from
+`package.json` metadata and distinguishes Vite from Storybook by package and
+server family. Unknown commands remain allowed; when one advertises a strongly
+attributed loopback server, its normalized command and working directory are
+learned for later duplicate checks. An opaque alias can therefore bypass
+deduplication once before it is learned.
 
 ## Validate
 

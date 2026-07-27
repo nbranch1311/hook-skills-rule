@@ -41,8 +41,20 @@ def now() -> str:
 
 
 def workspace_root(payload: dict[str, Any]) -> Path:
+    roots = [
+        Path(root).expanduser().resolve()
+        for root in payload.get("workspace_roots") or []
+    ]
+    cwd = command_cwd(payload)
+    containing = [root for root in roots if cwd == root or root in cwd.parents]
+    return max(containing, key=lambda root: len(root.parts)) if containing else cwd
+
+
+def command_cwd(payload: dict[str, Any]) -> Path:
+    tool_input = payload.get("tool_input") or {}
+    cwd = tool_input.get("working_directory") or payload.get("cwd")
     roots = payload.get("workspace_roots") or []
-    return Path(roots[0] if roots else payload.get("cwd") or ".").expanduser().resolve()
+    return Path(cwd or (roots[0] if roots else ".")).expanduser().resolve()
 
 
 def state_path(workspace: Path) -> Path:
@@ -50,7 +62,13 @@ def state_path(workspace: Path) -> Path:
 
 
 def empty_state() -> dict[str, Any]:
-    return {"version": STATE_VERSION, "applications": {}, "attempts": []}
+    return {
+        "version": STATE_VERSION,
+        "applications": {},
+        "attempts": [],
+        "learned": {},
+        "pending": {},
+    }
 
 
 def load_state(workspace: Path) -> dict[str, Any]:
@@ -62,6 +80,8 @@ def load_state(workspace: Path) -> dict[str, Any]:
         return empty_state()
     state.setdefault("applications", {})
     state.setdefault("attempts", [])
+    state.setdefault("learned", {})
+    state.setdefault("pending", {})
     return state
 
 
@@ -131,22 +151,8 @@ def command_hash(command: str) -> str:
 
 
 def package_script(command: str) -> str | None:
-    tokens = command_tokens(command)
-    if not tokens or tokens[0] != "pnpm":
-        return None
-    tokens = tokens[1:]
-    package = "."
-    for flag in ("--filter", "-F"):
-        if flag in tokens:
-            index = tokens.index(flag)
-            if index + 1 >= len(tokens):
-                return None
-            package = tokens[index + 1]
-            del tokens[index : index + 2]
-            break
-    if tokens and tokens[0] == "run":
-        tokens.pop(0)
-    return f"{package}:{tokens[0]}" if tokens and not tokens[0].startswith("-") else None
+    package, script = script_invocation(command)
+    return f"{package or '.'}:{script}" if script else None
 
 
 def load_applications(workspace: Path) -> list[dict[str, Any]]:
@@ -172,6 +178,132 @@ def configured_application(workspace: Path, command: str) -> dict[str, Any] | No
                     "name": application.get("name", application_id),
                 }
     return None
+
+
+def read_package(directory: Path) -> dict[str, Any]:
+    try:
+        return json.loads((directory / "package.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def nearest_package(workspace: Path, cwd: Path) -> Path:
+    directory = cwd
+    while directory != workspace and workspace in directory.parents:
+        if (directory / "package.json").exists():
+            return directory
+        directory = directory.parent
+    return workspace
+
+
+def named_packages(workspace: Path, name: str) -> list[Path]:
+    matches: list[Path] = []
+    for package_json in workspace.rglob("package.json"):
+        if "node_modules" in package_json.parts:
+            continue
+        if read_package(package_json.parent).get("name") == name:
+            matches.append(package_json.parent)
+    return matches
+
+
+def script_invocation(command: str) -> tuple[str | None, str | None]:
+    tokens = command_tokens(command)
+    if not tokens or tokens[0] not in {"npm", "pnpm", "yarn", "bun"}:
+        return None, None
+    manager = tokens.pop(0)
+    package: str | None = None
+    if manager == "yarn" and tokens[:1] == ["workspace"] and len(tokens) > 2:
+        return tokens[1], tokens[3] if tokens[2] == "run" and len(tokens) > 3 else tokens[2]
+    for flag in ("--filter", "-F", "--workspace", "-w"):
+        if flag in tokens:
+            index = tokens.index(flag)
+            if index + 1 < len(tokens):
+                package = tokens[index + 1]
+                del tokens[index : index + 2]
+                break
+    if tokens[:1] == ["run"]:
+        tokens.pop(0)
+    return package, tokens[0] if tokens and not tokens[0].startswith("-") else None
+
+
+def server_family(command: str) -> str | None:
+    tokens = command_tokens(command)
+    lowered = [token.lower() for token in tokens]
+    if "build" in lowered or "build-storybook" in lowered:
+        return None
+    if any("storybook" in token and "build-storybook" not in token for token in lowered):
+        return "storybook"
+    if "vite" in lowered:
+        return "vite"
+    return None
+
+
+def config_root(cwd: Path, command: str) -> Path | None:
+    tokens = command_tokens(command)
+    for flag in ("--config", "--config-dir", "-c"):
+        if flag not in tokens:
+            continue
+        index = tokens.index(flag)
+        if index + 1 >= len(tokens):
+            return None
+        path = Path(tokens[index + 1])
+        path = path if path.is_absolute() else cwd / path
+        return path.parent if path.suffix or path.name == ".storybook" else path
+    return None
+
+
+def inferred_application(
+    workspace: Path,
+    cwd: Path,
+    command: str,
+) -> dict[str, str] | None:
+    package_name, script = script_invocation(command)
+    matches = named_packages(workspace, package_name) if package_name else []
+    if package_name and len(matches) != 1:
+        return None
+    package = matches[0] if matches else None
+    package = package or nearest_package(workspace, config_root(cwd, command) or cwd)
+    body = str(read_package(package).get("scripts", {}).get(script, "")) if script else ""
+
+    nested_package, nested_script = script_invocation(body)
+    if nested_package:
+        nested_matches = named_packages(workspace, nested_package)
+        if len(nested_matches) != 1:
+            return None
+        package = nested_matches[0]
+        nested_body = read_package(package).get("scripts", {}).get(nested_script, "")
+        family = server_family(str(nested_body)) or server_family(body)
+    else:
+        family = server_family(body) or server_family(command)
+    if not family:
+        return None
+
+    try:
+        relative = package.relative_to(workspace).as_posix() or "."
+    except ValueError:
+        return None
+    package_label = read_package(package).get("name", relative)
+    return {
+        "id": f"{relative}:{family}",
+        "name": f"{package_label} {family}",
+    }
+
+
+def alias_key(cwd: Path, command: str) -> str:
+    value = f"{cwd}\0{normalize_command(command)}"
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def logical_application(
+    workspace: Path,
+    cwd: Path,
+    command: str,
+) -> dict[str, Any] | None:
+    configured = configured_application(workspace, command)
+    if configured:
+        return configured
+    learned = load_state(workspace)["learned"].get(alias_key(cwd, command))
+    return learned or inferred_application(workspace, cwd, command)
 
 
 def append_attempt(state: dict[str, Any], attempt: dict[str, Any]) -> None:
@@ -459,6 +591,11 @@ def observe_once(workspace: Path, application_id: str, attempt_id: str) -> bool:
         attempt = find_attempt(state, attempt_id)
         if attempt:
             attempt["state"] = "live"
+        if current.get("learnKey"):
+            state["learned"][current["learnKey"]] = {
+                "id": application_id,
+                "name": current["name"],
+            }
         save_state(workspace, state)
     return True
 
@@ -565,6 +702,69 @@ def revalidate(workspace: Path, session: str | None) -> list[str]:
         return notices
 
 
+def record_pending(workspace: Path, cwd: Path, command: str) -> None:
+    key = alias_key(cwd, command)
+    listeners_before = listener_snapshot()
+    reserved_until = time.time() + startup_timeout(workspace)
+    with state_lock(workspace):
+        state = load_state(workspace)
+        state["pending"] = {
+            pending_key: pending
+            for pending_key, pending in state["pending"].items()
+            if pending.get("reservedUntil", 0) > time.time()
+        }
+        state["pending"][key] = {
+            "command": display_command(command),
+            "commandHash": command_hash(command),
+            "listenersBefore": listeners_before,
+            "reservedUntil": reserved_until,
+        }
+        save_state(workspace, state)
+
+
+def promote_pending(
+    workspace: Path,
+    cwd: Path,
+    command: str,
+    result: dict[str, Any],
+) -> dict[str, str] | None:
+    key = alias_key(cwd, command)
+    urls = advertised_urls(result)
+    with state_lock(workspace):
+        state = load_state(workspace)
+        pending = state["pending"].pop(key, None)
+        if not pending or not urls:
+            if pending:
+                save_state(workspace, state)
+            return None
+        application = {
+            "id": f"fallback:{key[:16]}",
+            "name": pending["command"],
+        }
+        attempt_id = secrets.token_hex(8)
+        attempt = {
+            "applicationId": application["id"],
+            "at": now(),
+            "command": pending["command"],
+            "commandHash": pending["commandHash"],
+            "id": attempt_id,
+            "state": "starting",
+        }
+        state["applications"][application["id"]] = {
+            "advertisedUrls": urls,
+            "attemptId": attempt_id,
+            "commandHash": pending["commandHash"],
+            "learnKey": key,
+            "listenersBefore": pending["listenersBefore"],
+            "name": application["name"],
+            "reservedUntil": pending["reservedUntil"],
+            "state": "starting",
+        }
+        append_attempt(state, attempt)
+        save_state(workspace, state)
+        return application
+
+
 def duplicate_result(application: dict[str, Any]) -> dict[str, str]:
     name = application["name"]
     if application["state"] == "live":
@@ -588,9 +788,11 @@ def allow_result(notices: list[str]) -> dict[str, str]:
 def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
     command = payload.get("command") or ""
     workspace = workspace_root(payload)
+    cwd = command_cwd(payload)
     notices = revalidate(workspace, payload.get("session_id"))
-    configured = configured_application(workspace, command)
-    if not configured:
+    application = logical_application(workspace, cwd, command)
+    if not application:
+        record_pending(workspace, cwd, command)
         return allow_result(notices)
 
     fingerprint = command_hash(command)
@@ -598,7 +800,7 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
     listeners_before = listener_snapshot()
     with state_lock(workspace):
         state = load_state(workspace)
-        current = state["applications"].get(configured["id"])
+        current = state["applications"].get(application["id"])
         if current and (
             (
                 current["state"] == "starting"
@@ -609,7 +811,7 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
             append_attempt(
                 state,
                 {
-                    "applicationId": configured["id"],
+                    "applicationId": application["id"],
                     "at": now(),
                     "command": display_command(command),
                     "commandHash": fingerprint,
@@ -622,18 +824,18 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
 
         attempt_id = secrets.token_hex(8)
         attempt = {
-            "applicationId": configured["id"],
+            "applicationId": application["id"],
             "at": now(),
             "command": display_command(command),
             "commandHash": fingerprint,
             "id": attempt_id,
             "state": "starting",
         }
-        state["applications"][configured["id"]] = {
+        state["applications"][application["id"]] = {
             "attemptId": attempt_id,
             "commandHash": fingerprint,
             "listenersBefore": listeners_before,
-            "name": configured["name"],
+            "name": application["name"],
             "reservedUntil": time.time() + timeout,
             "state": "starting",
         }
@@ -645,16 +847,19 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
 def handle_post_tool(payload: dict[str, Any]) -> None:
     command = (payload.get("tool_input") or {}).get("command") or ""
     workspace = workspace_root(payload)
+    cwd = command_cwd(payload)
     revalidate(workspace, None)
-    configured = configured_application(workspace, command)
-    if not configured:
+    result = hook_result(payload)
+    application = logical_application(workspace, cwd, command)
+    if not application:
+        application = promote_pending(workspace, cwd, command, result)
+    if not application:
         return
 
-    result = hook_result(payload)
     fingerprint = command_hash(command)
     with state_lock(workspace):
         state = load_state(workspace)
-        current = state["applications"].get(configured["id"])
+        current = state["applications"].get(application["id"])
         if not current or current.get("commandHash") != fingerprint:
             return
         attempt_id = current["attemptId"]
@@ -672,11 +877,11 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
             }
         save_state(workspace, state)
 
-    if observe_once(workspace, configured["id"], attempt_id):
+    if observe_once(workspace, application["id"], attempt_id):
         return
     launch_observer(
         workspace,
-        configured["id"],
+        application["id"],
         attempt_id,
         startup_timeout(workspace),
     )

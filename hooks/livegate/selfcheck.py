@@ -12,7 +12,13 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from livegate import parse_lsof, parse_proc_started, parse_ss
+from livegate import (
+    command_cwd,
+    inferred_application,
+    parse_lsof,
+    parse_proc_started,
+    parse_ss,
+)
 
 HOOK = Path(__file__).with_name("livegate.py")
 
@@ -46,7 +52,7 @@ def main() -> int:
             json.dumps(
                 {
                     "version": 1,
-                    "startupTimeoutSeconds": 1,
+                    "startupTimeoutSeconds": 5,
                     "applications": [
                         {
                             "id": "docs",
@@ -55,7 +61,7 @@ def main() -> int:
                         },
                         {
                             "id": "filtered-docs",
-                            "packageScripts": ["@scope/docs:dev"],
+                            "packageScripts": ["@scope/mapped:dev"],
                         },
                         {
                             "id": "race",
@@ -81,17 +87,45 @@ def main() -> int:
                 }
             )
         )
+        packages = {
+            "docs": ("@scope/docs", {"dev": "vite", "storybook": "storybook dev"}),
+            "npm": ("@scope/npm", {"dev": "vite"}),
+            "yarn": ("@scope/yarn", {"dev": "vite"}),
+            "bun": ("@scope/bun", {"dev": "vite"}),
+            "direct": ("@scope/direct", {}),
+            "mapped": ("@scope/mapped", {"dev": "vite"}),
+        }
+        for directory, (name, scripts) in packages.items():
+            package = workspace / "apps" / directory
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(
+                json.dumps({"name": name, "scripts": scripts})
+            )
+        (workspace / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "root",
+                    "scripts": {"docs-alias": "pnpm --filter @scope/docs dev"},
+                }
+            )
+        )
         state_path = workspace / ".livegate" / "servers.json"
         state_path.parent.mkdir()
         state_path.write_text(json.dumps({"version": 1, "servers": {"legacy": {}}}))
 
-        def before(command: str, session: str = "session-1") -> dict[str, object]:
+        def before(
+            command: str,
+            session: str = "session-1",
+            cwd: Path = workspace,
+            roots: list[Path] | None = None,
+        ) -> dict[str, object]:
             return run_hook(
                 {
                     "hook_event_name": "beforeShellExecution",
                     "command": command,
+                    "cwd": str(cwd),
                     "session_id": session,
-                    "workspace_roots": [str(workspace)],
+                    "workspace_roots": [str(root) for root in (roots or [workspace])],
                 }
             )
 
@@ -101,6 +135,8 @@ def main() -> int:
             exit_code: int = 0,
             pid: int | None = None,
             error: str = "",
+            cwd: Path = workspace,
+            roots: list[Path] | None = None,
         ) -> dict[str, object]:
             return run_hook(
                 {
@@ -112,7 +148,8 @@ def main() -> int:
                         "stderr": error,
                         "stdout": output,
                     },
-                    "workspace_roots": [str(workspace)],
+                    "cwd": str(cwd),
+                    "workspace_roots": [str(root) for root in (roots or [workspace])],
                 }
             )
 
@@ -126,6 +163,107 @@ def main() -> int:
         assert parse_proc_started(
             "43 (python worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242"
         ) == "4242"
+        assert command_cwd(
+            {
+                "cwd": str(workspace),
+                "tool_input": {"working_directory": str(workspace / "apps" / "docs")},
+            }
+        ) == workspace / "apps" / "docs"
+
+        assert inferred_application(workspace, workspace, "pnpm docs-alias") == {
+            "id": "apps/docs:vite",
+            "name": "@scope/docs vite",
+        }
+        assert inferred_application(
+            workspace,
+            workspace,
+            "pnpm --filter @scope/docs dev",
+        ) == {
+            "id": "apps/docs:vite",
+            "name": "@scope/docs vite",
+        }
+        assert before("pnpm docs-alias") == {"permission": "allow"}
+        state = json.loads(state_path.read_text())
+        assert state["applications"]["apps/docs:vite"]["state"] == "starting"
+        assert state["applications"]["apps/docs:vite"]["reservedUntil"] > time.time()
+        filtered_docs = before("pnpm --filter @scope/docs dev")
+        assert filtered_docs["permission"] == "deny", filtered_docs
+        assert before("pnpm --filter @scope/docs storybook") == {"permission": "allow"}
+        state = json.loads(state_path.read_text())
+        assert state["applications"]["apps/docs:storybook"]["state"] == "starting"
+
+        assert before("npm run dev --workspace @scope/npm") == {"permission": "allow"}
+        assert before("yarn workspace @scope/yarn dev") == {"permission": "allow"}
+        assert before("yarn workspace @scope/yarn run dev")["permission"] == "deny"
+        assert before(
+            "bun run dev",
+            cwd=workspace / "apps" / "bun",
+        ) == {"permission": "allow"}
+        assert before(
+            "pnpm exec vite",
+            cwd=workspace / "apps" / "direct",
+        ) == {"permission": "allow"}
+        state = json.loads(state_path.read_text())
+        assert {
+            "apps/npm:vite",
+            "apps/yarn:vite",
+            "apps/bun:vite",
+            "apps/direct:vite",
+        }.issubset(state["applications"])
+        assert inferred_application(
+            workspace,
+            workspace,
+            "pnpm exec vite --config apps/direct/vite.config.ts",
+        )["id"] == "apps/direct:vite"
+        assert inferred_application(
+            workspace,
+            workspace,
+            "storybook dev -c apps/docs/.storybook",
+        )["id"] == "apps/docs:storybook"
+        assert inferred_application(
+            workspace,
+            workspace,
+            "storybook dev --config-dir apps/docs/.storybook",
+        )["id"] == "apps/docs:storybook"
+        assert before("pnpm exec vite build") == {"permission": "allow"}
+        assert before("storybook build") == {"permission": "allow"}
+
+        duplicate = workspace / "duplicates" / "npm"
+        duplicate.mkdir(parents=True)
+        (duplicate / "package.json").write_text(
+            json.dumps({"name": "@scope/npm", "scripts": {"dev": "vite"}})
+        )
+        root_package = json.loads((workspace / "package.json").read_text())
+        root_package["scripts"]["dev"] = "vite"
+        (workspace / "package.json").write_text(json.dumps(root_package))
+        assert (
+            inferred_application(
+                workspace,
+                workspace,
+                "npm run dev --workspace @scope/npm",
+            )
+            is None
+        )
+        assert before("npm run dev --workspace @scope/npm") == {"permission": "allow"}
+
+        secondary = workspace / "secondary"
+        secondary.mkdir()
+        (secondary / "package.json").write_text(
+            json.dumps({"name": "secondary", "scripts": {"dev": "vite"}})
+        )
+        assert before(
+            "pnpm dev",
+            cwd=secondary,
+            roots=[workspace, secondary],
+        ) == {"permission": "allow"}
+        secondary_state = json.loads(
+            (secondary / ".livegate" / "servers.json").read_text()
+        )
+        assert secondary_state["applications"][".:vite"]["state"] == "starting"
+
+        assert before("./opaque-server") == {"permission": "allow"}
+        assert post("./opaque-server", "completed") == {}
+        assert before("./opaque-server") == {"permission": "allow"}
 
         assert before("pnpm build") == {"permission": "allow"}
         race_results: list[dict[str, object]] = []
@@ -222,6 +360,24 @@ def main() -> int:
             fallback.shutdown()
             thread.join()
 
+        assert before("./serve-local") == {"permission": "allow"}
+        learned = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        thread = threading.Thread(target=learned.serve_forever)
+        thread.start()
+        try:
+            learned_url = f"http://127.0.0.1:{learned.server_port}/"
+            assert post(
+                "./serve-local",
+                f"Local: {learned_url}",
+                pid=os.getpid(),
+            ) == {}
+            assert before("./serve-local")["permission"] == "deny"
+            state = json.loads(state_path.read_text())
+            assert state["learned"]
+        finally:
+            learned.shutdown()
+            thread.join()
+
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -234,9 +390,12 @@ def main() -> int:
         finally:
             listener.close()
 
+        config = json.loads((workspace / "livegate.json").read_text())
+        config["startupTimeoutSeconds"] = 1
+        (workspace / "livegate.json").write_text(json.dumps(config))
         assert before("pnpm timeout") == {"permission": "allow"}
         assert post("pnpm timeout", "still building", pid=os.getpid()) == {}
-        time.sleep(1.5)
+        time.sleep(2.5)
         state = json.loads(state_path.read_text())
         assert "timeout" not in state["applications"]
         timeout_attempt = next(
@@ -246,17 +405,16 @@ def main() -> int:
         )
         assert timeout_attempt["state"] == "failed"
         assert "within 1 seconds" in timeout_attempt["reason"]
-
-        assert before("pnpm --filter @scope/docs run dev") == {"permission": "allow"}
+        assert before("pnpm --filter @scope/mapped run dev") == {"permission": "allow"}
         state = json.loads(state_path.read_text())
         assert state["applications"]["filtered-docs"]["state"] == "starting"
         assert post(
-            "pnpm --filter @scope/docs run dev",
+            "pnpm --filter @scope/mapped run dev",
             "",
             exit_code=1,
             error="API_TOKEN=secret DATABASE_PASSWORD=hunter2 crash",
         ) == {}
-        time.sleep(1.5)
+        time.sleep(2.5)
         state = json.loads(state_path.read_text())
         assert "filtered-docs" not in state["applications"]
         assert state["attempts"][-1]["state"] == "failed"
@@ -269,7 +427,7 @@ def main() -> int:
             {"id": str(index), "state": "failed"} for index in range(50)
         ]
         state_path.write_text(json.dumps(state))
-        assert before("pnpm --filter @scope/docs run dev") == {"permission": "allow"}
+        assert before("pnpm --filter @scope/mapped run dev") == {"permission": "allow"}
         state = json.loads(state_path.read_text())
         assert len(state["attempts"]) == 50
         assert state["attempts"][0]["id"] == "1"
