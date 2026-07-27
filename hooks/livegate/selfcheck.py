@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from livegate import (
+    approval_matches,
     command_cwd,
     inferred_application,
     parse_lsof,
@@ -169,6 +171,31 @@ def main() -> int:
                 "tool_input": {"working_directory": str(workspace / "apps" / "docs")},
             }
         ) == workspace / "apps" / "docs"
+        approval = {
+            "applicationId": "docs",
+            "commandHash": "command",
+            "expiresAt": time.time() + 300,
+            "session": "session",
+            "workspace": str(workspace),
+        }
+        assert approval_matches(approval, workspace, "docs", "command", "session")
+        assert not approval_matches(
+            approval,
+            workspace / "other",
+            "docs",
+            "command",
+            "session",
+        )
+        assert not approval_matches(approval, workspace, "other", "command", "session")
+        assert not approval_matches(approval, workspace, "docs", "other", "session")
+        assert not approval_matches(approval, workspace, "docs", "command", "other")
+        assert not approval_matches(
+            {**approval, "expiresAt": 0},
+            workspace,
+            "docs",
+            "command",
+            "session",
+        )
 
         assert inferred_application(workspace, workspace, "pnpm docs-alias") == {
             "id": "apps/docs:vite",
@@ -283,7 +310,7 @@ def main() -> int:
 
         assert before("API_TOKEN=secret pnpm dev") == {"permission": "allow"}
         state = json.loads(state_path.read_text())
-        assert state["version"] == 2
+        assert state["version"] == 3
         assert state["applications"]["docs"]["state"] == "starting"
         assert "secret" not in state_path.read_text()
         assert "/.livegate/" in (workspace / ".gitignore").read_text().splitlines()
@@ -293,15 +320,15 @@ def main() -> int:
         assert "already starting" in duplicate["user_message"]
 
         server = HTTPServer(("127.0.0.1", 0), HealthyHandler)
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
+        first_thread = threading.Thread(target=server.serve_forever)
+        first_thread.start()
         try:
             url = f"http://127.0.0.1:{server.server_port}/"
             assert post("pnpm dev", f"Local: {url}", exit_code=1, pid=os.getpid()) == {}
             state = json.loads(state_path.read_text())
             assert state["applications"]["docs"]["state"] == "live"
-            assert state["applications"]["docs"]["url"] == url
-            assert state["applications"]["docs"]["processFingerprint"]
+            assert state["applications"]["docs"]["instances"][0]["url"] == url
+            assert state["applications"]["docs"]["instances"][0]["processFingerprint"]
             docs_attempt = next(
                 attempt
                 for attempt in state["attempts"]
@@ -318,15 +345,69 @@ def main() -> int:
             duplicate = before("pnpm run docs")
             assert duplicate["permission"] == "deny"
             assert url in duplicate["user_message"]
+            assert "reuse, restart, or launch a second instance" in duplicate["user_message"]
+            assert str(os.getpid()) in duplicate["agent_message"]
+            token = re.search(
+                r"LIVEGATE_SECOND=([a-f0-9]+)",
+                duplicate["agent_message"],
+            ).group(1)
 
-            state = json.loads(state_path.read_text())
-            state["applications"]["docs"]["processFingerprint"] = "reused"
-            state_path.write_text(json.dumps(state))
-            assert before("pnpm build", session="session-3") == {"permission": "allow"}
-            assert "docs" not in json.loads(state_path.read_text())["applications"]
+            assert before("LIVEGATE_SECOND=wrong pnpm run docs")["permission"] == "deny"
+            approved = f"LIVEGATE_SECOND={token} pnpm run docs"
+            assert before(approved) == {"permission": "allow"}
+
+            second = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+            second_thread = threading.Thread(target=second.serve_forever)
+            second_thread.start()
+            try:
+                second_url = f"http://127.0.0.1:{second.server_port}/"
+                assert post(
+                    approved,
+                    f"Local: {second_url}",
+                    pid=os.getpid(),
+                ) == {}
+                state = json.loads(state_path.read_text())
+                assert [instance["url"] for instance in state["applications"]["docs"]["instances"]] == [
+                    url,
+                    second_url,
+                ]
+                assert before(approved)["permission"] == "deny"
+
+                duplicate = before("pnpm run docs")
+                assert url in duplicate["user_message"]
+                assert second_url in duplicate["user_message"]
+                stale_token = re.search(
+                    r"LIVEGATE_SECOND=([a-f0-9]+)",
+                    duplicate["agent_message"],
+                ).group(1)
+                state = json.loads(state_path.read_text())
+                state["approvals"][stale_token]["expiresAt"] = 0
+                state_path.write_text(json.dumps(state))
+                assert before(
+                    f"LIVEGATE_SECOND={stale_token} pnpm run docs"
+                )["permission"] == "deny"
+
+                server.shutdown()
+                first_thread.join()
+                assert before("pnpm build", session="session-3")["permission"] == "allow"
+                state = json.loads(state_path.read_text())
+                assert [instance["url"] for instance in state["applications"]["docs"]["instances"]] == [
+                    second_url
+                ]
+
+                second.shutdown()
+                second_thread.join()
+                assert before("pnpm build", session="session-4") == {"permission": "allow"}
+                assert "docs" not in json.loads(state_path.read_text())["applications"]
+                assert before("pnpm run docs") == {"permission": "allow"}
+            finally:
+                if second_thread.is_alive():
+                    second.shutdown()
+                    second_thread.join()
         finally:
-            server.shutdown()
-            thread.join()
+            if first_thread.is_alive():
+                server.shutdown()
+                first_thread.join()
 
         preexisting = HTTPServer(("127.0.0.1", 0), HealthyHandler)
         thread = threading.Thread(target=preexisting.serve_forever)
@@ -353,7 +434,7 @@ def main() -> int:
             assert post("pnpm fallback", "ready", pid=os.getpid()) == {}
             state = json.loads(state_path.read_text())
             assert state["applications"]["fallback"]["state"] == "live"
-            assert state["applications"]["fallback"]["url"].endswith(
+            assert state["applications"]["fallback"]["instances"][0]["url"].endswith(
                 f":{fallback.server_port}/"
             )
         finally:

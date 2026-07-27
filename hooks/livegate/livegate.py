@@ -21,7 +21,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 STARTING_SECONDS = 60
 STATE_NAME = "servers.json"
 CONFIG_NAME = "livegate.json"
@@ -66,6 +66,7 @@ def empty_state() -> dict[str, Any]:
         "version": STATE_VERSION,
         "applications": {},
         "attempts": [],
+        "approvals": {},
         "learned": {},
         "pending": {},
     }
@@ -80,6 +81,7 @@ def load_state(workspace: Path) -> dict[str, Any]:
         return empty_state()
     state.setdefault("applications", {})
     state.setdefault("attempts", [])
+    state.setdefault("approvals", {})
     state.setdefault("learned", {})
     state.setdefault("pending", {})
     return state
@@ -148,6 +150,35 @@ def display_command(command: str) -> str:
 
 def command_hash(command: str) -> str:
     return hashlib.sha256(normalize_command(command).encode()).hexdigest()
+
+
+def requested_second(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    prefix = "LIVEGATE_SECOND="
+    return next(
+        (token[len(prefix) :] for token in tokens if token.startswith(prefix)),
+        None,
+    )
+
+
+def approval_matches(
+    approval: dict[str, Any] | None,
+    workspace: Path,
+    application_id: str,
+    command_fingerprint: str,
+    session: str,
+) -> bool:
+    return bool(
+        approval
+        and approval.get("workspace") == str(workspace)
+        and approval.get("applicationId") == application_id
+        and approval.get("commandHash") == command_fingerprint
+        and approval.get("session") == session
+        and approval.get("expiresAt", 0) > time.time()
+    )
 
 
 def package_script(command: str) -> str | None:
@@ -555,7 +586,10 @@ def mark_failed(
         current = state["applications"].get(application_id)
         if not current or current.get("attemptId") != attempt_id:
             return
-        state["applications"].pop(application_id)
+        if current.get("instances"):
+            current["state"] = "live"
+        else:
+            state["applications"].pop(application_id)
         attempt = find_attempt(state, attempt_id)
         if attempt:
             attempt.update({"reason": reason[:300], "state": "failed"})
@@ -578,16 +612,18 @@ def observe_once(workspace: Path, application_id: str, attempt_id: str) -> bool:
         current = state["applications"].get(application_id)
         if not current or current.get("attemptId") != attempt_id:
             return False
-        current.update(
-            {
-                "pid": identity["pid"],
-                "processFingerprint": identity["fingerprint"],
-                "processStarted": identity["started"],
-                "since": now(),
-                "state": "live",
-                "url": url,
-            }
-        )
+        instance = {
+            "pid": identity["pid"],
+            "processFingerprint": identity["fingerprint"],
+            "processStarted": identity["started"],
+            "shellPid": current.get("shellPid"),
+            "since": now(),
+            "url": url,
+        }
+        instances = current.setdefault("instances", [])
+        if not any(existing["url"] == url for existing in instances):
+            instances.append(instance)
+        current["state"] = "live"
         attempt = find_attempt(state, attempt_id)
         if attempt:
             attempt["state"] = "live"
@@ -652,35 +688,37 @@ def revalidate(workspace: Path, session: str | None) -> list[str]:
     applications = {
         application_id: dict(application)
         for application_id, application in snapshot["applications"].items()
-        if application.get("state") == "live"
+        if application.get("instances")
     }
     if not applications:
         return []
 
     listeners = listener_pids()
-    health: dict[str, bool] = {}
+    healthy_instances: dict[str, list[dict[str, Any]]] = {}
     for application_id, application in applications.items():
-        try:
-            port = urlsplit(application["url"]).port or (
-                443 if application["url"].startswith("https:") else 80
-            )
-        except (KeyError, ValueError):
-            health[application_id] = False
-            continue
-        pid = listeners.get(port)
-        health[application_id] = bool(
-            pid
-            and pid == application.get("pid")
-            and process_started(pid) == application.get("processStarted")
-            and process_fingerprint(pid) == application.get("processFingerprint")
-            and endpoint_open(application["url"])
-        )
+        healthy_instances[application_id] = []
+        for instance in application["instances"]:
+            try:
+                port = urlsplit(instance["url"]).port or (
+                    443 if instance["url"].startswith("https:") else 80
+                )
+            except (KeyError, ValueError):
+                continue
+            pid = listeners.get(port)
+            if (
+                pid
+                and pid == instance.get("pid")
+                and process_started(pid) == instance.get("processStarted")
+                and process_fingerprint(pid) == instance.get("processFingerprint")
+                and endpoint_open(instance["url"])
+            ):
+                healthy_instances[application_id].append(instance)
 
     with state_lock(workspace):
         state = load_state(workspace)
         notices: list[str] = []
         changed = False
-        for application_id, was_healthy in health.items():
+        for application_id, instances in healthy_instances.items():
             application = state["applications"].get(application_id)
             if (
                 not application
@@ -688,13 +726,22 @@ def revalidate(workspace: Path, session: str | None) -> list[str]:
                 != applications[application_id].get("attemptId")
             ):
                 continue
-            if not was_healthy:
+            if application.get("instances") != instances:
+                application["instances"] = instances
+                changed = True
+            actively_starting = (
+                application.get("state") == "starting"
+                and application.get("reservedUntil", 0) > time.time()
+            )
+            if not instances and not actively_starting:
                 state["applications"].pop(application_id)
                 changed = True
-            elif session and application.get("notifiedSession") != session:
+            elif instances and session and application.get("notifiedSession") != session:
                 application["notifiedSession"] = session
                 notices.append(
-                    f"{application['name']} is already running at {application['url']}."
+                    f"{application['name']} is already running at "
+                    + ", ".join(instance["url"] for instance in instances)
+                    + "."
                 )
                 changed = True
         if changed:
@@ -765,16 +812,34 @@ def promote_pending(
         return application
 
 
-def duplicate_result(application: dict[str, Any]) -> dict[str, str]:
+def duplicate_result(
+    application: dict[str, Any],
+    approval: str | None = None,
+) -> dict[str, str]:
     name = application["name"]
-    if application["state"] == "live":
-        message = f"{name} is already running at {application['url']}. Reuse it instead."
-    else:
-        message = f"{name} is already starting. Reuse it instead."
+    instances = application.get("instances", [])
+    if not instances:
+        return {
+            "permission": "deny",
+            "user_message": f"{name} is already starting. Reuse it instead.",
+            "agent_message": f"Reuse the existing {name} launch; do not start another.",
+        }
+    urls = ", ".join(instance["url"] for instance in instances)
+    metadata = "; ".join(
+        f"{instance['url']} (pid {instance['pid']}, shell {instance.get('shellPid') or 'unknown'})"
+        for instance in instances
+    )
     return {
         "permission": "deny",
-        "user_message": message,
-        "agent_message": f"Reuse the existing {name} server; do not start another instance.",
+        "user_message": (
+            f"{name} is already running at {urls}. Choose reuse, restart, "
+            "or launch a second instance."
+        ),
+        "agent_message": (
+            f"Existing {name}: {metadata}. Ask the user to reuse, restart, or "
+            "launch a second instance. For an explicitly approved second instance, "
+            f"retry once with LIVEGATE_SECOND={approval}."
+        ),
     }
 
 
@@ -800,14 +865,39 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
     listeners_before = listener_snapshot()
     with state_lock(workspace):
         state = load_state(workspace)
+        state["approvals"] = {
+            token: approval
+            for token, approval in state["approvals"].items()
+            if approval.get("expiresAt", 0) > time.time()
+        }
         current = state["applications"].get(application["id"])
-        if current and (
-            (
+        token = requested_second(command)
+        approval = state["approvals"].pop(token, None) if token else None
+        approved = approval_matches(
+            approval,
+            workspace,
+            application["id"],
+            fingerprint,
+            str(payload.get("session_id") or ""),
+        )
+        duplicate = current and (
+            current.get("instances")
+            or (
                 current["state"] == "starting"
                 and current.get("reservedUntil", 0) > time.time()
             )
-            or (current["state"] == "live" and endpoint_open(current["url"]))
-        ):
+        )
+        if duplicate and not approved:
+            approval_token: str | None = None
+            if current.get("instances"):
+                approval_token = secrets.token_hex(8)
+                state["approvals"][approval_token] = {
+                    "applicationId": application["id"],
+                    "commandHash": fingerprint,
+                    "expiresAt": time.time() + 300,
+                    "session": str(payload.get("session_id") or ""),
+                    "workspace": str(workspace),
+                }
             append_attempt(
                 state,
                 {
@@ -820,7 +910,7 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
                 },
             )
             save_state(workspace, state)
-            return duplicate_result(current)
+            return duplicate_result(current, approval_token)
 
         attempt_id = secrets.token_hex(8)
         attempt = {
@@ -834,6 +924,7 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
         state["applications"][application["id"]] = {
             "attemptId": attempt_id,
             "commandHash": fingerprint,
+            "instances": current.get("instances", []) if current else [],
             "listenersBefore": listeners_before,
             "name": application["name"],
             "reservedUntil": time.time() + timeout,

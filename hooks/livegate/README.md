@@ -1,3 +1,8 @@
+---
+status: active
+verified: 2026-07-27
+---
+
 # LiveGate
 
 LiveGate is a global Cursor hook that stops agents from starting duplicate
@@ -76,10 +81,12 @@ When LiveGate first creates it in a Git workspace, it adds:
 /.livegate/
 ```
 
-The version 2 state contains:
+The version 3 state contains:
 
-- logical applications that are `starting` or `live`
+- logical applications and all of their `starting` or `live` instances
 - the latest 50 redacted launch attempts
+
+Version 3 intentionally ignores older state because the instance model changed.
 
 ## Behavior
 
@@ -93,6 +100,12 @@ The version 2 state contains:
   without supervising or terminating the server.
 - A verified live application denies later equivalent commands and reports its
   existing URL.
+- Duplicate feedback offers reuse, a targeted agent-managed restart, or an
+  explicitly approved second instance. Second instances require the one-use
+  five-minute token returned by the denial; LiveGate never stops or starts the
+  process itself.
+- Every approved instance remains listed under the same logical application,
+  and stopping one does not hide surviving instances.
 - Live instances are revalidated after agent events using their PID, process
   start identity, and endpoint. Stale instances are removed.
 - Unknown commands are allowed.
