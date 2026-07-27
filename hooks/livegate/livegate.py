@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import fcntl
 import hashlib
 from http.client import HTTPException
 import json
@@ -21,6 +20,11 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 STATE_VERSION = 3
 STARTING_SECONDS = 60
 STATE_NAME = "servers.json"
@@ -31,9 +35,7 @@ LOCAL_URL = re.compile(
     re.IGNORECASE,
 )
 ENVIRONMENT_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-SECRET = re.compile(
-    r"(?i)\b([A-Za-z0-9_]*(?:token|key|secret|password)[A-Za-z0-9_]*)=([^\s]+)",
-)
+OUTPUT_ASSIGNMENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 
 
 def now() -> str:
@@ -77,8 +79,10 @@ def empty_state() -> dict[str, Any]:
 def load_state(workspace: Path) -> dict[str, Any]:
     try:
         state = json.loads(state_path(workspace).read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         return empty_state()
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError("LiveGate state is unreadable") from error
     if state.get("version") != STATE_VERSION:
         return empty_state()
     state.setdefault("applications", {})
@@ -108,7 +112,17 @@ def state_lock(workspace: Path):
     directory = workspace / ".livegate"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / ".lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is None:
+            raise RuntimeError("state locking is unsupported")
+        deadline = time.monotonic() + 0.02
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.001)
         try:
             yield
         finally:
@@ -411,25 +425,31 @@ def parse_proc_started(stat: str) -> str | None:
     return process_fields[19] if len(process_fields) > 19 else None
 
 
+def inspection_command(system: str) -> tuple[list[str], Any] | None:
+    if system == "Darwin":
+        return ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"], parse_lsof
+    if system == "Linux":
+        return ["ss", "-ltnpH"], parse_ss
+    return None
+
+
 def listener_pids() -> dict[int, int]:
-    if platform.system() == "Darwin":
-        command = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]
-        parser = parse_lsof
-    elif platform.system() == "Linux":
-        command = ["ss", "-ltnpH"]
-        parser = parse_ss
-    else:
-        return {}
+    inspection = inspection_command(platform.system())
+    if not inspection:
+        raise RuntimeError(f"unsupported platform: {platform.system()}")
+    command, parser = inspection
     try:
         result = subprocess.run(
             command,
             check=False,
             capture_output=True,
             text=True,
-            timeout=1,
+            timeout=0.1,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
+    except OSError as error:
+        raise RuntimeError(f"missing listener tool: {command[0]}") from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"listener inspection timed out: {command[0]}") from error
     return parser(result.stdout)
 
 
@@ -445,7 +465,7 @@ def process_started(pid: int) -> str | None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=1,
+            timeout=0.1,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -461,7 +481,7 @@ def process_fingerprint(pid: int) -> str | None:
                 ["ps", "-o", "command=", "-p", str(pid)],
                 check=False,
                 capture_output=True,
-                timeout=1,
+                timeout=0.1,
             )
             command = result.stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -471,11 +491,7 @@ def process_fingerprint(pid: int) -> str | None:
 
 def listener_snapshot() -> dict[str, dict[str, Any]]:
     return {
-        str(port): {
-            "fingerprint": process_fingerprint(pid),
-            "pid": pid,
-            "started": process_started(pid),
-        }
+        str(port): {"pid": pid}
         for port, pid in listener_pids().items()
     }
 
@@ -490,7 +506,7 @@ def is_descendant(pid: int, ancestor: int) -> bool:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=1,
+                timeout=0.1,
             )
             parent = result.stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
@@ -505,7 +521,7 @@ def endpoint_open(url: str) -> bool:
     try:
         with urlopen(
             url,
-            timeout=0.2,
+            timeout=0.05,
             context=ssl._create_unverified_context(),
         ) as response:
             response.read(1)
@@ -548,7 +564,10 @@ def diagnostic(result: dict[str, Any]) -> str | None:
     text = result.get("stderr") or result.get("message")
     if not text:
         return None
-    return SECRET.sub(r"\1=<redacted>", " ".join(str(text).split()))[-300:]
+    return OUTPUT_ASSIGNMENT.sub(
+        r"\1=<redacted>",
+        " ".join(str(text).split()),
+    )[-300:]
 
 
 def listener_for_url(url: str) -> tuple[int, dict[str, Any]] | None:
@@ -577,7 +596,7 @@ def attributed_advertised(
             continue
         port, identity = listener
         if (
-            baseline.get(str(port)) != identity
+            baseline.get(str(port), {}).get("pid") != identity["pid"]
             and identity.get("started")
             and identity.get("fingerprint")
         ):
@@ -603,7 +622,7 @@ def attributed_candidate(application: dict[str, Any]) -> tuple[str, dict[str, An
         }
         url = f"http://127.0.0.1:{port}/"
         if (
-            baseline.get(str(port)) != identity
+            baseline.get(str(port), {}).get("pid") != identity["pid"]
             and identity.get("started")
             and identity.get("fingerprint")
             and is_descendant(pid, int(shell_pid))
@@ -862,6 +881,38 @@ def revalidate_groups(workspace: Path, session: str | None) -> list[str]:
         if changed:
             save_state(workspace, state)
         return notices
+
+
+def failure_notices(workspace: Path) -> tuple[list[str], list[str]]:
+    with state_lock(workspace):
+        state = load_state(workspace)
+        notices: list[str] = []
+        attempt_ids: list[str] = []
+        for attempt in state["attempts"]:
+            if attempt.get("state") != "failed" or attempt.get("notified"):
+                continue
+            identity = attempt.get("applicationId") or attempt.get("groupId") or "launch"
+            notices.append(
+                f"LiveGate: {identity} failed: {attempt.get('reason', 'startup failed')}."
+            )
+            attempt_ids.append(attempt["id"])
+        return notices, attempt_ids
+
+
+def deliver_failure_notices(
+    workspace: Path,
+    attempt_ids: list[str],
+    result: dict[str, str],
+) -> dict[str, str]:
+    if not attempt_ids:
+        return result
+    with state_lock(workspace):
+        state = load_state(workspace)
+        for attempt in state["attempts"]:
+            if attempt.get("id") in attempt_ids:
+                attempt["notified"] = True
+        save_state(workspace, state)
+    return result
 
 
 def record_pending(workspace: Path, cwd: Path, command: str) -> None:
@@ -1294,15 +1345,24 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
     command = payload.get("command") or ""
     workspace = workspace_root(payload)
     cwd = command_cwd(payload)
-    notices = revalidate(workspace, payload.get("session_id"))
+    notices, failure_attempt_ids = failure_notices(workspace)
+    notices.extend(revalidate(workspace, payload.get("session_id")))
     notices.extend(revalidate_groups(workspace, payload.get("session_id")))
     group_spec = launch_group(workspace, cwd, command)
     if group_spec:
-        return handle_group_before(payload, workspace, command, group_spec, notices)
+        return deliver_failure_notices(
+            workspace,
+            failure_attempt_ids,
+            handle_group_before(payload, workspace, command, group_spec, notices),
+        )
     application = logical_application(workspace, cwd, command)
     if not application:
         record_pending(workspace, cwd, command)
-        return allow_result(notices)
+        return deliver_failure_notices(
+            workspace,
+            failure_attempt_ids,
+            allow_result(notices),
+        )
 
     fingerprint = command_hash(command)
     timeout = startup_timeout(workspace)
@@ -1353,6 +1413,9 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
                     "state": "denied",
                 },
             )
+            for attempt in state["attempts"]:
+                if attempt.get("id") in failure_attempt_ids:
+                    attempt["notified"] = True
             save_state(workspace, state)
             return duplicate_result(current, approval_token)
 
@@ -1376,7 +1439,11 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
         }
         append_attempt(state, attempt)
         save_state(workspace, state)
-    return allow_result(notices)
+    return deliver_failure_notices(
+        workspace,
+        failure_attempt_ids,
+        allow_result(notices),
+    )
 
 
 def handle_post_tool(payload: dict[str, Any]) -> None:
@@ -1430,18 +1497,35 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) == 6:
-        observer = observe_group_until if sys.argv[1] == "--observe-group" else observe
-        return observer(Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]))
+    try:
+        if len(sys.argv) == 6:
+            observer = observe_group_until if sys.argv[1] == "--observe-group" else observe
+            return observer(
+                Path(sys.argv[2]),
+                sys.argv[3],
+                sys.argv[4],
+                int(sys.argv[5]),
+            )
 
-    payload = json.loads(sys.stdin.read() or "{}")
-    if payload.get("hook_event_name") == "beforeShellExecution":
-        print(json.dumps(handle_before_shell(payload)))
-    elif payload.get("hook_event_name") == "postToolUse":
-        handle_post_tool(payload)
-        print("{}")
-    else:
-        print("{}")
+        payload = json.loads(sys.stdin.read() or "{}")
+        if payload.get("hook_event_name") == "beforeShellExecution":
+            print(json.dumps(handle_before_shell(payload)))
+        elif payload.get("hook_event_name") == "postToolUse":
+            handle_post_tool(payload)
+            print("{}")
+        else:
+            print("{}")
+    except Exception as error:
+        print(
+            json.dumps(
+                {
+                    "permission": "allow",
+                    "agent_message": (
+                        f"LiveGate warning ({type(error).__name__}); command allowed."
+                    ),
+                }
+            )
+        )
     return 0
 
 

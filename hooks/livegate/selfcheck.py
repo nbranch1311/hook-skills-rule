@@ -12,23 +12,42 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from livegate import (
     approval_matches,
     command_cwd,
     inferred_application,
+    inspection_command,
+    listener_pids,
     parse_lsof,
     parse_proc_started,
     parse_ss,
+    state_lock,
 )
 
 HOOK = Path(__file__).with_name("livegate.py")
 
 
-def run_hook(payload: dict[str, object]) -> dict[str, object]:
+def run_hook(
+    payload: dict[str, object],
+    environment: dict[str, str] | None = None,
+) -> dict[str, object]:
     result = subprocess.run(
         [sys.executable, "-B", str(HOOK)],
         input=json.dumps(payload),
+        check=True,
+        capture_output=True,
+        env={**os.environ, **(environment or {})},
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def run_raw(value: str) -> dict[str, object]:
+    result = subprocess.run(
+        [sys.executable, "-B", str(HOOK)],
+        input=value,
         check=True,
         capture_output=True,
         text=True,
@@ -166,6 +185,68 @@ def main() -> int:
                     "workspace_roots": [str(root) for root in (roots or [workspace])],
                 }
             )
+
+        assert inspection_command("Windows") is None
+        real_run = subprocess.run
+
+        def time_out_inspection(
+            command: list[str],
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            if command[0] in {"lsof", "ss"}:
+                raise subprocess.TimeoutExpired(command, 1)
+            return real_run(command, *args, **kwargs)
+
+        with patch(
+            "livegate.subprocess.run",
+            side_effect=time_out_inspection,
+        ):
+            try:
+                listener_pids()
+                raise AssertionError("inspection timeout did not fail open")
+            except RuntimeError:
+                pass
+        malformed = run_raw("{")
+        assert malformed["permission"] == "allow"
+        assert "warning" in malformed["agent_message"]
+
+        missing_tool = run_hook(
+            {
+                "hook_event_name": "beforeShellExecution",
+                "command": "pnpm dev",
+                "cwd": str(workspace),
+                "workspace_roots": [str(workspace)],
+            },
+            environment={"PATH": ""},
+        )
+        assert missing_tool["permission"] == "allow"
+        assert "warning" in missing_tool["agent_message"]
+
+        with state_lock(workspace):
+            contended = before("pnpm dev")
+        assert contended["permission"] == "allow"
+        assert "warning" in contended["agent_message"]
+
+        state_path.write_text("{")
+        corrupt = before("pnpm build")
+        assert corrupt["permission"] == "allow"
+        assert "warning" in corrupt["agent_message"]
+        state_path.write_text(json.dumps({"version": 1}))
+
+        started = time.perf_counter()
+        assert before("echo performance") == {"permission": "allow"}
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.2, elapsed
+
+        assert before("./privacy-check") == {"permission": "allow"}
+        assert post(
+            "./privacy-check",
+            "API_TOKEN=raw-secret FULL_OUTPUT_MARKER",
+        ) == {}
+        persisted = state_path.read_text()
+        assert "raw-secret" not in persisted
+        assert "FULL_OUTPUT_MARKER" not in persisted
 
         assert parse_lsof("p41\nn127.0.0.1:5173\np42\nn[::1]:6006\n") == {
             5173: 41,
@@ -319,7 +400,7 @@ def main() -> int:
                 pid=os.getpid(),
             ) == {}
             stack_api_thread.start()
-            time.sleep(1)
+            time.sleep(2)
             state = json.loads(state_path.read_text())
             configured_group_id = next(
                 group_id
@@ -463,7 +544,9 @@ def main() -> int:
             )
             assert docs_attempt["shell"]["exitCode"] == 1
 
+            started = time.perf_counter()
             rediscovered = before("pnpm build", session="session-2")
+            assert time.perf_counter() - started < 0.2
             assert rediscovered["permission"] == "allow"
             assert url in rediscovered["agent_message"]
             assert before("pnpm build", session="session-2") == {"permission": "allow"}
@@ -612,14 +695,16 @@ def main() -> int:
         )
         assert timeout_attempt["state"] == "failed"
         assert "within 1 seconds" in timeout_attempt["reason"]
-        assert before("pnpm --filter @scope/mapped run dev") == {"permission": "allow"}
+        timeout_notice = before("pnpm --filter @scope/mapped run dev")
+        assert timeout_notice["permission"] == "allow"
+        assert "timeout failed" in timeout_notice["agent_message"]
         state = json.loads(state_path.read_text())
         assert state["applications"]["filtered-docs"]["state"] == "starting"
         assert post(
             "pnpm --filter @scope/mapped run dev",
             "",
             exit_code=1,
-            error="API_TOKEN=secret DATABASE_PASSWORD=hunter2 crash",
+            error="API_TOKEN=secret DATABASE_PASSWORD=hunter2 ACCOUNT=private crash",
         ) == {}
         time.sleep(2.5)
         state = json.loads(state_path.read_text())
@@ -627,11 +712,16 @@ def main() -> int:
         assert state["attempts"][-1]["state"] == "failed"
         assert (
             state["attempts"][-1]["reason"]
-            == "API_TOKEN=<redacted> DATABASE_PASSWORD=<redacted> crash"
+            == "API_TOKEN=<redacted> DATABASE_PASSWORD=<redacted> ACCOUNT=<redacted> crash"
         )
+        failure_notice = before("pnpm build", session="failure-session")
+        assert "ACCOUNT=<redacted>" in failure_notice["agent_message"]
+        assert "private" not in failure_notice["agent_message"]
+        assert before("pnpm build", session="failure-session") == {"permission": "allow"}
 
         state["attempts"] = [
-            {"id": str(index), "state": "failed"} for index in range(50)
+            {"id": str(index), "notified": True, "state": "failed"}
+            for index in range(50)
         ]
         state_path.write_text(json.dumps(state))
         assert before("pnpm --filter @scope/mapped run dev") == {"permission": "allow"}

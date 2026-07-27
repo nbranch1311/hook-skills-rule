@@ -39,7 +39,7 @@ chmod +x ~/.cursor/hooks/livegate/livegate.py ~/.cursor/hooks/livegate/selfcheck
   "hooks": {
     "postToolUse": [
       {
-        "command": "./hooks/livegate/livegate.py",
+        "command": "~/.cursor/hooks/livegate/livegate.py",
         "matcher": "Shell",
         "failClosed": false,
         "timeout": 5
@@ -47,8 +47,8 @@ chmod +x ~/.cursor/hooks/livegate/livegate.py ~/.cursor/hooks/livegate/selfcheck
     ],
     "beforeShellExecution": [
       {
-        "command": "./hooks/livegate/livegate.py",
-        "failClosed": true,
+        "command": "~/.cursor/hooks/livegate/livegate.py",
+        "failClosed": false,
         "timeout": 5
       }
     ]
@@ -59,6 +59,9 @@ chmod +x ~/.cursor/hooks/livegate/livegate.py ~/.cursor/hooks/livegate/selfcheck
 No command matcher is used: LiveGate reads optional application mappings from
 the current workspace, resolves common JavaScript package scripts, and learns
 strongly attributed custom commands.
+
+The module has no Python package dependencies. It uses only the standard
+library and the detected platform listener tool.
 
 4. Validate the installation:
 
@@ -87,6 +90,16 @@ The version 3 state contains:
 - the latest 50 redacted launch attempts
 
 Version 3 intentionally ignores older state because the instance model changed.
+Version-1 state and legacy recipe semantics are unsupported.
+
+## Domain model
+
+- **Logical Application**: stable deduplication identity, independent of port.
+- **Server Instance**: one verified agent-origin process and its endpoints.
+- **Launch Attempt**: one agent shell command and its separate shell outcome.
+- **Launch Group**: one command that starts multiple applications or endpoints.
+- **Agent Provenance**: PID, process-start identity, endpoint, and fingerprint
+  evidence tying an instance to an observed agent launch.
 
 ## Behavior
 
@@ -118,6 +131,20 @@ Version 3 intentionally ignores older state because the instance model changed.
 
 Cursor hook `permission: "ask"` is unreliable today, so LiveGate uses `deny`
 for duplicate starts.
+
+Routine successful starts and health checks are quiet. Duplicate decisions,
+failed launches, and explicit exception flows return concise feedback. Internal
+errors, unavailable inspection tools, lock contention, unsupported platforms,
+and inspection timeouts fail open; only a verified duplicate is denied.
+
+LiveGate observes agent Shell events only. It ignores commands and processes
+started manually by users. It never launches, stops, restarts, supervises, or
+continuously polls application servers. Startup waiting is bounded and runs
+only in a detached observer process.
+
+macOS and Linux are supported initially. Windows and other unsupported
+platforms fail open. Ordinary synchronous events target less than 200 ms and
+make no model or external network calls.
 
 ## Workspace mappings
 
