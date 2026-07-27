@@ -3,7 +3,7 @@
   "hooks": {
     "postToolUse": [
       {
-        "command": "~/.cursor/hooks/livegate/livegate.py",
+        "command": "./hooks/livegate/livegate.py",
         "matcher": "Shell",
         "failClosed": false,
         "timeout": 5
@@ -11,8 +11,8 @@
     ],
     "beforeShellExecution": [
       {
-        "command": "~/.cursor/hooks/livegate/livegate.py",
-        "failClosed": false,
+        "command": "./hooks/livegate/livegate.py",
+        "failClosed": true,
         "timeout": 5
       }
     ]

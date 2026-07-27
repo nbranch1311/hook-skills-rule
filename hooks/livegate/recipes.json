@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "probeTimeoutSeconds": 60,
+  "recipes": [
+    {
+      "id": "dev",
+      "name": "development server",
+      "port": 5173,
+      "start": [
+        "^\\s*(?:LIVEGATE_RESTART=1\\s+)?(?:pnpm|yarn|bun)\\s+(?:run\\s+)?dev(?:\\s|$)",
+        "^\\s*(?:LIVEGATE_RESTART=1\\s+)?npm\\s+run\\s+dev(?:\\s|$)",
+        "\\bdev:vite\\b",
+        "^\\s*(?:pnpm\\s+exec\\s+|npx\\s+)?vite(?:\\s|$)"
+      ],
+      "exclude": [
+        "\\b(?:test|vitest|build)\\b"
+      ],
+      "stop": [
+        "\\bpkill\\b.*\\bvite\\b",
+        "\\bdev:stop\\b"
+      ]
+    },
+    {
+      "id": "storybook",
+      "name": "Storybook",
+      "port": 6006,
+      "start": [
+        "\\bstorybook(?:\\s+dev|:app)?\\b"
+      ],
+      "exclude": [
+        "\\b(?:build-storybook|storybook\\s+build)\\b"
+      ],
+      "stop": [
+        "\\bpkill\\b.*\\bstorybook\\b",
+        "\\bstorybook:stop\\b"
+      ]
+    }
+  ],
+  "stop": [
+    "\\bkill-port\\b",
+    "\\bpkill\\b",
+    "\\bkill\\s+",
+    "\\btaskkill\\b",
+    "\\bStop-Process\\b",
+    "\\blsof\\s+-ti\\s*:?[0-9]+"
+  ]
+}
