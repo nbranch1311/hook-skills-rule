@@ -106,6 +106,10 @@ Version 3 intentionally ignores older state because the instance model changed.
   process itself.
 - Every approved instance remains listed under the same logical application,
   and stopping one does not hide surviving instances.
+- Commands mapped to multiple applications are tracked as launch groups.
+  Ambiguous commands advertising multiple endpoints receive a learned fallback
+  group identity. Partially live groups become `degraded` and remain protected
+  from automatic relaunch.
 - Live instances are revalidated after agent events using their PID, process
   start identity, and endpoint. Stale instances are removed.
 - Unknown commands are allowed.
@@ -129,6 +133,16 @@ Add an optional committed `livegate.json` at the workspace root:
       "name": "Documentation",
       "commands": ["pnpm dev", "pnpm run docs"],
       "packageScripts": ["@scope/docs:dev"]
+      },
+      {
+        "id": "stack-ui",
+        "commands": ["pnpm stack"],
+        "endpointIndex": 0
+      },
+      {
+        "id": "stack-api",
+        "commands": ["pnpm stack"],
+        "endpointIndex": 1
     }
   ]
 }

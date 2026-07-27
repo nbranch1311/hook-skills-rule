@@ -85,6 +85,18 @@ def main() -> int:
                             "id": "timeout",
                             "commands": ["pnpm timeout"],
                         },
+                        {
+                            "id": "stack-ui",
+                            "name": "Stack UI",
+                            "commands": ["pnpm stack"],
+                            "endpointIndex": 0,
+                        },
+                        {
+                            "id": "stack-api",
+                            "name": "Stack API",
+                            "commands": ["pnpm stack"],
+                            "endpointIndex": 1,
+                        },
                     ],
                 }
             )
@@ -291,6 +303,120 @@ def main() -> int:
         assert before("./opaque-server") == {"permission": "allow"}
         assert post("./opaque-server", "completed") == {}
         assert before("./opaque-server") == {"permission": "allow"}
+
+        assert before("pnpm stack") == {"permission": "allow"}
+        stack_ui = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        stack_api = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        stack_ui_thread = threading.Thread(target=stack_ui.serve_forever)
+        stack_api_thread = threading.Thread(target=stack_api.serve_forever)
+        stack_ui_thread.start()
+        try:
+            stack_ui_url = f"http://127.0.0.1:{stack_ui.server_port}/"
+            stack_api_url = f"http://127.0.0.1:{stack_api.server_port}/"
+            assert post(
+                "pnpm stack",
+                f"UI: {stack_ui_url}\nAPI: {stack_api_url}",
+                pid=os.getpid(),
+            ) == {}
+            stack_api_thread.start()
+            time.sleep(1)
+            state = json.loads(state_path.read_text())
+            configured_group_id = next(
+                group_id
+                for group_id, group in state["groups"].items()
+                if group.get("applicationIds") == ["stack-ui", "stack-api"]
+            )
+            assert state["groups"][configured_group_id]["state"] == "live"
+            assert {
+                member["applicationId"]
+                for member in state["groups"][configured_group_id]["members"]
+            } == {"stack-ui", "stack-api"}
+            group_duplicate = before("pnpm stack")
+            assert group_duplicate["permission"] == "deny"
+            assert stack_ui_url in group_duplicate["user_message"]
+            assert stack_api_url in group_duplicate["user_message"]
+            assert "targeted recovery, full restart, or launch a second group" in group_duplicate["user_message"]
+
+            stack_ui.shutdown()
+            stack_ui_thread.join()
+            assert before("pnpm build", session="group-session")["permission"] == "allow"
+            state = json.loads(state_path.read_text())
+            assert state["groups"][configured_group_id]["state"] == "degraded"
+            degraded = before("pnpm stack")
+            assert degraded["permission"] == "deny"
+            assert "Stack UI" in degraded["user_message"]
+            assert "Stack API" in degraded["user_message"]
+            assert stack_api_url in degraded["user_message"]
+
+            token = re.search(
+                r"LIVEGATE_SECOND=([a-f0-9]+)",
+                degraded["agent_message"],
+            ).group(1)
+            approved_group = f"LIVEGATE_SECOND={token} pnpm stack"
+            assert before(approved_group) == {"permission": "allow"}
+            second_ui = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+            second_api = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+            second_ui_thread = threading.Thread(target=second_ui.serve_forever)
+            second_api_thread = threading.Thread(target=second_api.serve_forever)
+            second_ui_thread.start()
+            second_api_thread.start()
+            try:
+                second_ui_url = f"http://127.0.0.1:{second_ui.server_port}/"
+                second_api_url = f"http://127.0.0.1:{second_api.server_port}/"
+                assert post(
+                    approved_group,
+                    f"UI: {second_ui_url}\nAPI: {second_api_url}",
+                    pid=os.getpid(),
+                ) == {}
+                state = json.loads(state_path.read_text())
+                assert {
+                    member["url"]
+                    for member in state["groups"][configured_group_id]["members"]
+                } == {stack_api_url, second_ui_url, second_api_url}
+                assert len(
+                    {
+                        member["attemptId"]
+                        for member in state["groups"][configured_group_id]["members"]
+                    }
+                ) == 2
+            finally:
+                second_ui.shutdown()
+                second_api.shutdown()
+                second_ui_thread.join()
+                second_api_thread.join()
+        finally:
+            if stack_ui_thread.is_alive():
+                stack_ui.shutdown()
+                stack_ui_thread.join()
+            if stack_api_thread.is_alive():
+                stack_api.shutdown()
+                stack_api_thread.join()
+
+        assert before("./multi-server") == {"permission": "allow"}
+        multi_a = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        multi_b = HTTPServer(("127.0.0.1", 0), HealthyHandler)
+        multi_a_thread = threading.Thread(target=multi_a.serve_forever)
+        multi_b_thread = threading.Thread(target=multi_b.serve_forever)
+        multi_a_thread.start()
+        multi_b_thread.start()
+        try:
+            multi_a_url = f"http://127.0.0.1:{multi_a.server_port}/"
+            multi_b_url = f"http://127.0.0.1:{multi_b.server_port}/"
+            assert post(
+                "./multi-server",
+                f"{multi_a_url}\n{multi_b_url}",
+                pid=os.getpid(),
+            ) == {}
+            state = json.loads(state_path.read_text())
+            assert state["learnedGroups"]
+            fallback_group_id = next(iter(state["learnedGroups"].values()))["id"]
+            assert state["groups"][fallback_group_id]["expectedMembers"] == 2
+            assert before("./multi-server")["permission"] == "deny"
+        finally:
+            multi_a.shutdown()
+            multi_b.shutdown()
+            multi_a_thread.join()
+            multi_b_thread.join()
 
         assert before("pnpm build") == {"permission": "allow"}
         race_results: list[dict[str, object]] = []

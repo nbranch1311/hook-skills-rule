@@ -67,7 +67,9 @@ def empty_state() -> dict[str, Any]:
         "applications": {},
         "attempts": [],
         "approvals": {},
+        "groups": {},
         "learned": {},
+        "learnedGroups": {},
         "pending": {},
     }
 
@@ -82,7 +84,9 @@ def load_state(workspace: Path) -> dict[str, Any]:
     state.setdefault("applications", {})
     state.setdefault("attempts", [])
     state.setdefault("approvals", {})
+    state.setdefault("groups", {})
     state.setdefault("learned", {})
+    state.setdefault("learnedGroups", {})
     state.setdefault("pending", {})
     return state
 
@@ -195,20 +199,29 @@ def load_applications(workspace: Path) -> list[dict[str, Any]]:
     return applications if isinstance(applications, list) else []
 
 
-def configured_application(workspace: Path, command: str) -> dict[str, Any] | None:
+def configured_applications(workspace: Path, command: str) -> list[dict[str, Any]]:
     normalized = normalize_command(command)
     script = package_script(command)
+    matches: list[dict[str, Any]] = []
     for application in load_applications(workspace):
         commands = [normalize_command(value) for value in application.get("commands", [])]
         scripts = application.get("packageScripts", [])
         if normalized in commands or (script and script in scripts):
             application_id = application.get("id")
             if isinstance(application_id, str) and application_id:
-                return {
-                    "id": application_id,
-                    "name": application.get("name", application_id),
-                }
-    return None
+                matches.append(
+                    {
+                        "endpointIndex": application.get("endpointIndex"),
+                        "id": application_id,
+                        "name": application.get("name", application_id),
+                    }
+                )
+    return matches
+
+
+def configured_application(workspace: Path, command: str) -> dict[str, Any] | None:
+    matches = configured_applications(workspace, command)
+    return matches[0] if len(matches) == 1 else None
 
 
 def read_package(directory: Path) -> dict[str, Any]:
@@ -335,6 +348,30 @@ def logical_application(
         return configured
     learned = load_state(workspace)["learned"].get(alias_key(cwd, command))
     return learned or inferred_application(workspace, cwd, command)
+
+
+def launch_group(
+    workspace: Path,
+    cwd: Path,
+    command: str,
+) -> dict[str, Any] | None:
+    configured = configured_applications(workspace, command)
+    if len(configured) > 1:
+        identity = ",".join(sorted(application["id"] for application in configured))
+        return {
+            "applications": configured,
+            "id": f"group:{hashlib.sha256(identity.encode()).hexdigest()[:16]}",
+            "name": display_command(command),
+        }
+    learned = load_state(workspace)["learnedGroups"].get(alias_key(cwd, command))
+    if learned:
+        return {
+            "applications": [],
+            "expectedMembers": learned["expectedMembers"],
+            "id": learned["id"],
+            "name": display_command(command),
+        }
+    return None
 
 
 def append_attempt(state: dict[str, Any], attempt: dict[str, Any]) -> None:
@@ -529,10 +566,12 @@ def listener_for_url(url: str) -> tuple[int, dict[str, Any]] | None:
     }
 
 
-def attributed_candidate(application: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+def attributed_advertised(
+    application: dict[str, Any],
+) -> list[tuple[int, str, dict[str, Any]]]:
     baseline = application.get("listenersBefore", {})
-    shell_pid = application.get("shellPid")
-    for url in application.get("advertisedUrls", []):
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    for index, url in enumerate(application.get("advertisedUrls", [])):
         listener = listener_for_url(url)
         if not listener or not endpoint_open(url):
             continue
@@ -542,8 +581,18 @@ def attributed_candidate(application: dict[str, Any]) -> tuple[str, dict[str, An
             and identity.get("started")
             and identity.get("fingerprint")
         ):
-            return url, identity
+            candidates.append((index, url, identity))
+    return candidates
 
+
+def attributed_candidate(application: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    advertised = attributed_advertised(application)
+    if advertised:
+        _, url, identity = advertised[0]
+        return url, identity
+
+    baseline = application.get("listenersBefore", {})
+    shell_pid = application.get("shellPid")
     if not shell_pid:
         return None
     for port, pid in listener_pids().items():
@@ -683,6 +732,23 @@ def launch_observer(
     )
 
 
+def instance_healthy(instance: dict[str, Any], listeners: dict[int, int]) -> bool:
+    try:
+        port = urlsplit(instance["url"]).port or (
+            443 if instance["url"].startswith("https:") else 80
+        )
+    except (KeyError, ValueError):
+        return False
+    pid = listeners.get(port)
+    return bool(
+        pid
+        and pid == instance.get("pid")
+        and process_started(pid) == instance.get("processStarted")
+        and process_fingerprint(pid) == instance.get("processFingerprint")
+        and endpoint_open(instance["url"])
+    )
+
+
 def revalidate(workspace: Path, session: str | None) -> list[str]:
     snapshot = load_state(workspace)
     applications = {
@@ -696,23 +762,11 @@ def revalidate(workspace: Path, session: str | None) -> list[str]:
     listeners = listener_pids()
     healthy_instances: dict[str, list[dict[str, Any]]] = {}
     for application_id, application in applications.items():
-        healthy_instances[application_id] = []
-        for instance in application["instances"]:
-            try:
-                port = urlsplit(instance["url"]).port or (
-                    443 if instance["url"].startswith("https:") else 80
-                )
-            except (KeyError, ValueError):
-                continue
-            pid = listeners.get(port)
-            if (
-                pid
-                and pid == instance.get("pid")
-                and process_started(pid) == instance.get("processStarted")
-                and process_fingerprint(pid) == instance.get("processFingerprint")
-                and endpoint_open(instance["url"])
-            ):
-                healthy_instances[application_id].append(instance)
+        healthy_instances[application_id] = [
+            instance
+            for instance in application["instances"]
+            if instance_healthy(instance, listeners)
+        ]
 
     with state_lock(workspace):
         state = load_state(workspace)
@@ -741,6 +795,67 @@ def revalidate(workspace: Path, session: str | None) -> list[str]:
                 notices.append(
                     f"{application['name']} is already running at "
                     + ", ".join(instance["url"] for instance in instances)
+                    + "."
+                )
+                changed = True
+        if changed:
+            save_state(workspace, state)
+        return notices
+
+
+def revalidate_groups(workspace: Path, session: str | None) -> list[str]:
+    snapshot = load_state(workspace)
+    groups = {
+        group_id: dict(group)
+        for group_id, group in snapshot["groups"].items()
+        if group.get("members")
+    }
+    if not groups:
+        return []
+    listeners = listener_pids()
+    healthy = {
+        group_id: [
+            member
+            for member in group["members"]
+            if instance_healthy(member, listeners)
+        ]
+        for group_id, group in groups.items()
+    }
+    with state_lock(workspace):
+        state = load_state(workspace)
+        notices: list[str] = []
+        changed = False
+        for group_id, members in healthy.items():
+            group = state["groups"].get(group_id)
+            if not group or group.get("attemptId") != groups[group_id].get("attemptId"):
+                continue
+            if group.get("members") != members:
+                group["members"] = members
+                changed = True
+            actively_starting = (
+                group.get("state") == "starting"
+                and group.get("reservedUntil", 0) > time.time()
+            )
+            if not members and not actively_starting:
+                state["groups"].pop(group_id)
+                changed = True
+                continue
+            current_attempt_members = sum(
+                member.get("attemptId") == group.get("attemptId") for member in members
+            )
+            new_state = (
+                "live"
+                if current_attempt_members >= group["expectedMembers"]
+                else "degraded"
+            )
+            if members and group.get("state") != new_state:
+                group["state"] = new_state
+                changed = True
+            if members and session and group.get("notifiedSession") != session:
+                group["notifiedSession"] = session
+                notices.append(
+                    f"{group['name']} group is {new_state}: "
+                    + ", ".join(member["url"] for member in members)
                     + "."
                 )
                 changed = True
@@ -812,6 +927,331 @@ def promote_pending(
         return application
 
 
+def promote_group(
+    workspace: Path,
+    cwd: Path,
+    command: str,
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    urls = advertised_urls(result)
+    if len(urls) < 2:
+        return None
+    key = alias_key(cwd, command)
+    with state_lock(workspace):
+        state = load_state(workspace)
+        pending = state["pending"].pop(key, None)
+        if not pending:
+            return None
+        group_id = f"group:fallback:{key[:16]}"
+        attempt_id = secrets.token_hex(8)
+        state["groups"][group_id] = {
+            "advertisedUrls": urls,
+            "applicationIds": [],
+            "applicationMappings": [],
+            "attemptId": attempt_id,
+            "commandHash": pending["commandHash"],
+            "expectedMembers": len(urls),
+            "learnKey": key,
+            "listenersBefore": pending["listenersBefore"],
+            "members": [],
+            "name": pending["command"],
+            "reservedUntil": pending["reservedUntil"],
+            "state": "starting",
+        }
+        append_attempt(
+            state,
+            {
+                "applicationIds": [],
+                "at": now(),
+                "command": pending["command"],
+                "commandHash": pending["commandHash"],
+                "groupId": group_id,
+                "id": attempt_id,
+                "state": "starting",
+            },
+        )
+        save_state(workspace, state)
+        return {"applications": [], "id": group_id, "name": pending["command"]}
+
+
+def group_duplicate_result(group: dict[str, Any], token: str) -> dict[str, str]:
+    members = group.get("members", [])
+    live = ", ".join(
+        f"{member.get('name', 'endpoint')} at {member['url']}" for member in members
+    )
+    application_ids = group.get("applicationIds", [])
+    application_names = group.get("applicationNames", {})
+    live_ids = {member.get("applicationId") for member in members}
+    failed = [application_id for application_id in application_ids if application_id not in live_ids]
+    failure = (
+        f" Failed: {', '.join(application_names.get(item, item) for item in failed)}."
+        if failed
+        else ""
+    )
+    return {
+        "permission": "deny",
+        "user_message": (
+            f"{group['name']} launch group is {group['state']}. Live: {live}.{failure} "
+            "Choose targeted recovery, full restart, or launch a second group."
+        ),
+        "agent_message": (
+            "Do not relaunch automatically. Ask the user which recovery they want. "
+            "For an explicitly approved second group attempt, retry once with "
+            f"LIVEGATE_SECOND={token}."
+        ),
+    }
+
+
+def handle_group_before(
+    payload: dict[str, Any],
+    workspace: Path,
+    command: str,
+    group_spec: dict[str, Any],
+    notices: list[str],
+) -> dict[str, str]:
+    fingerprint = command_hash(command)
+    applications = group_spec["applications"]
+    application_ids = [application["id"] for application in applications]
+    listeners_before = listener_snapshot()
+    with state_lock(workspace):
+        state = load_state(workspace)
+        current = state["groups"].get(group_spec["id"])
+        requested = requested_second(command)
+        approval = state["approvals"].pop(requested, None) if requested else None
+        approved = approval_matches(
+            approval,
+            workspace,
+            group_spec["id"],
+            fingerprint,
+            str(payload.get("session_id") or ""),
+        )
+        duplicate = current and (
+            current.get("members")
+            or (
+                current.get("state") == "starting"
+                and current.get("reservedUntil", 0) > time.time()
+            )
+        )
+        if duplicate and not approved:
+            token = secrets.token_hex(8)
+            state["approvals"][token] = {
+                "applicationId": group_spec["id"],
+                "commandHash": fingerprint,
+                "expiresAt": time.time() + 300,
+                "session": str(payload.get("session_id") or ""),
+                "workspace": str(workspace),
+            }
+            append_attempt(
+                state,
+                {
+                    "applicationIds": current.get("applicationIds", []),
+                    "at": now(),
+                    "command": display_command(command),
+                    "commandHash": fingerprint,
+                    "groupId": group_spec["id"],
+                    "id": secrets.token_hex(8),
+                    "state": "denied",
+                },
+            )
+            save_state(workspace, state)
+            return group_duplicate_result(current, token)
+
+        attempt_id = secrets.token_hex(8)
+        mappings = applications or (current or {}).get("applicationMappings", [])
+        expected = (
+            len(mappings)
+            or (current or {}).get("expectedMembers")
+            or group_spec.get("expectedMembers", 0)
+        )
+        state["groups"][group_spec["id"]] = {
+            "applicationIds": application_ids or (current or {}).get("applicationIds", []),
+            "applicationNames": (
+                {application["id"]: application["name"] for application in applications}
+                or (current or {}).get("applicationNames", {})
+            ),
+            "applicationMappings": mappings,
+            "attemptId": attempt_id,
+            "commandHash": fingerprint,
+            "expectedMembers": expected,
+            "listenersBefore": listeners_before,
+            "members": (current or {}).get("members", []),
+            "name": group_spec["name"],
+            "reservedUntil": time.time() + startup_timeout(workspace),
+            "state": "starting",
+        }
+        append_attempt(
+            state,
+            {
+                "applicationIds": application_ids,
+                "at": now(),
+                "command": display_command(command),
+                "commandHash": fingerprint,
+                "groupId": group_spec["id"],
+                "id": attempt_id,
+                "state": "starting",
+            },
+        )
+        save_state(workspace, state)
+    return allow_result(notices)
+
+
+def observe_group(workspace: Path, group_id: str, attempt_id: str) -> bool:
+    with state_lock(workspace):
+        state = load_state(workspace)
+        current = state["groups"].get(group_id)
+        if not current or current.get("attemptId") != attempt_id:
+            return False
+        group = dict(current)
+    candidates = attributed_advertised(group)
+    if not candidates:
+        return False
+    mappings = group.get("applicationMappings", [])
+    members: list[dict[str, Any]] = []
+    for endpoint_index, url, identity in candidates:
+        mapping = next(
+            (
+                application
+                for position, application in enumerate(mappings)
+                if application.get("endpointIndex", position) == endpoint_index
+            ),
+            None,
+        )
+        members.append(
+            {
+                "applicationId": (
+                    mapping["id"] if mapping else f"endpoint-{endpoint_index + 1}"
+                ),
+                "attemptId": attempt_id,
+                "name": (
+                    mapping["name"] if mapping else f"Endpoint {endpoint_index + 1}"
+                ),
+                "pid": identity["pid"],
+                "processFingerprint": identity["fingerprint"],
+                "processStarted": identity["started"],
+                "shellPid": group.get("shellPid"),
+                "since": now(),
+                "url": url,
+            }
+        )
+    with state_lock(workspace):
+        state = load_state(workspace)
+        current = state["groups"].get(group_id)
+        if not current or current.get("attemptId") != attempt_id:
+            return False
+        existing = {
+            member["url"]: member for member in current.get("members", [])
+        }
+        existing.update({member["url"]: member for member in members})
+        current["members"] = list(existing.values())
+        current_attempt_members = sum(
+            member.get("attemptId") == attempt_id for member in current["members"]
+        )
+        current["state"] = (
+            "live"
+            if current_attempt_members >= current["expectedMembers"]
+            else "degraded"
+        )
+        if current.get("learnKey"):
+            state["learnedGroups"][current["learnKey"]] = {
+                "expectedMembers": current["expectedMembers"],
+                "id": group_id,
+            }
+        attempt = find_attempt(state, attempt_id)
+        if attempt:
+            attempt["state"] = current["state"]
+        save_state(workspace, state)
+        return current["state"] == "live"
+
+
+def observe_group_until(
+    workspace: Path,
+    group_id: str,
+    attempt_id: str,
+    timeout: int,
+) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if observe_group(workspace, group_id, attempt_id):
+            return 0
+        time.sleep(0.2)
+    with state_lock(workspace):
+        state = load_state(workspace)
+        group = state["groups"].get(group_id)
+        if not group or group.get("attemptId") != attempt_id:
+            return 0
+        attempt = find_attempt(state, attempt_id)
+        if group.get("members"):
+            group["state"] = "degraded"
+            if attempt:
+                attempt["state"] = "degraded"
+        else:
+            state["groups"].pop(group_id)
+            if attempt:
+                attempt.update(
+                    {
+                        "reason": f"Launch group did not open within {timeout} seconds",
+                        "state": "failed",
+                    }
+                )
+        save_state(workspace, state)
+    return 1
+
+
+def launch_group_observer(
+    workspace: Path,
+    group_id: str,
+    attempt_id: str,
+    timeout: int,
+) -> None:
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-B",
+            str(Path(__file__).resolve()),
+            "--observe-group",
+            str(workspace),
+            group_id,
+            attempt_id,
+            str(timeout),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def handle_group_post(
+    workspace: Path,
+    group_spec: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    with state_lock(workspace):
+        state = load_state(workspace)
+        current = state["groups"].get(group_spec["id"])
+        if not current:
+            return
+        attempt_id = current["attemptId"]
+        current["advertisedUrls"] = advertised_urls(result)
+        if isinstance(result.get("pid"), int):
+            current["shellPid"] = result["pid"]
+        attempt = find_attempt(state, attempt_id)
+        if attempt:
+            attempt["shell"] = {
+                key: result[key]
+                for key in ("exitCode", "status")
+                if result.get(key) is not None
+            }
+        save_state(workspace, state)
+    if not observe_group(workspace, group_spec["id"], attempt_id):
+        launch_group_observer(
+            workspace,
+            group_spec["id"],
+            attempt_id,
+            startup_timeout(workspace),
+        )
+
+
 def duplicate_result(
     application: dict[str, Any],
     approval: str | None = None,
@@ -855,6 +1295,10 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, str]:
     workspace = workspace_root(payload)
     cwd = command_cwd(payload)
     notices = revalidate(workspace, payload.get("session_id"))
+    notices.extend(revalidate_groups(workspace, payload.get("session_id")))
+    group_spec = launch_group(workspace, cwd, command)
+    if group_spec:
+        return handle_group_before(payload, workspace, command, group_spec, notices)
     application = logical_application(workspace, cwd, command)
     if not application:
         record_pending(workspace, cwd, command)
@@ -940,7 +1384,14 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
     workspace = workspace_root(payload)
     cwd = command_cwd(payload)
     revalidate(workspace, None)
+    revalidate_groups(workspace, None)
     result = hook_result(payload)
+    group_spec = launch_group(workspace, cwd, command)
+    if not group_spec and len(advertised_urls(result)) > 1:
+        group_spec = promote_group(workspace, cwd, command, result)
+    if group_spec:
+        handle_group_post(workspace, group_spec, result)
+        return
     application = logical_application(workspace, cwd, command)
     if not application:
         application = promote_pending(workspace, cwd, command, result)
@@ -979,13 +1430,9 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) == 6 and sys.argv[1] == "--observe":
-        return observe(
-            Path(sys.argv[2]),
-            sys.argv[3],
-            sys.argv[4],
-            int(sys.argv[5]),
-        )
+    if len(sys.argv) == 6:
+        observer = observe_group_until if sys.argv[1] == "--observe-group" else observe
+        return observer(Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]))
 
     payload = json.loads(sys.stdin.read() or "{}")
     if payload.get("hook_event_name") == "beforeShellExecution":
