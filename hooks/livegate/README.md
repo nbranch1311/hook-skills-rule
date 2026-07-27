@@ -69,6 +69,16 @@ library and the detected platform listener tool.
 python3 -B ~/.cursor/hooks/livegate/selfcheck.py
 ```
 
+## File layout
+
+- `livegate.py`: executable hook entrypoint.
+- `livegate_hooks.py`: Cursor before/post hook policy and feedback.
+- `livegate_lifecycle.py`: observation, revalidation, fallback promotion, and failure notices.
+- `livegate_identity.py`: workspace mappings, JavaScript package inference, and learned identities.
+- `livegate_platform.py`: macOS/Linux process, listener, endpoint, and attribution helpers.
+- `livegate_state.py`: v3 state schema, locking, writes, and attempt helpers.
+- `livegate_commands.py`: command normalization, redaction, hashing, and approval tokens.
+
 ## Current state
 
 Each workspace gets one ignored file:
@@ -163,16 +173,16 @@ Add an optional committed `livegate.json` at the workspace root:
       "name": "Documentation",
       "commands": ["pnpm dev", "pnpm run docs"],
       "packageScripts": ["@scope/docs:dev"]
-      },
-      {
-        "id": "stack-ui",
-        "commands": ["pnpm stack"],
-        "endpointIndex": 0
-      },
-      {
-        "id": "stack-api",
-        "commands": ["pnpm stack"],
-        "endpointIndex": 1
+    },
+    {
+      "id": "stack-ui",
+      "commands": ["pnpm stack"],
+      "endpointIndex": 0
+    },
+    {
+      "id": "stack-api",
+      "commands": ["pnpm stack"],
+      "endpointIndex": 1
     }
   ]
 }

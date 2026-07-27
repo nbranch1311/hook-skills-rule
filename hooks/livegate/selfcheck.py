@@ -15,18 +15,18 @@ from pathlib import Path
 from typing import Callable
 from unittest.mock import patch
 
-from livegate import (
-    approval_matches,
+from livegate_commands import approval_matches
+from livegate_hooks import command_cwd
+from livegate_identity import inferred_application
+from livegate_platform import (
     advertised_urls,
-    command_cwd,
-    inferred_application,
     inspection_command,
     listener_pids,
     parse_lsof,
     parse_proc_started,
     parse_ss,
-    state_lock,
 )
+from livegate_state import state_lock
 
 HOOK = Path(__file__).with_name("livegate.py")
 
@@ -251,7 +251,7 @@ def main() -> int:
             return real_run(command, *args, **kwargs)
 
         with patch(
-            "livegate.subprocess.run",
+            "livegate_platform.subprocess.run",
             side_effect=time_out_inspection,
         ):
             try:
