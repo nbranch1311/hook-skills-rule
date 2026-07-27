@@ -27,7 +27,9 @@ RESTART_ENV = "LIVEGATE_RESTART=1"
 # ponytail: seed heuristics only decide when to observe; learned evidence does the gating.
 START_RE = re.compile(r"\b(?:dev|serve|start|storybook|vite|next|nuxt|astro|uvicorn|flask|runserver|livegate-run)\b", re.I)
 EXCLUDE_RE = re.compile(r"\b(?:test|vitest|build|lint|typecheck|build-storybook|storybook\s+build)\b", re.I)
-STOP_RE = re.compile(r"\b(?:kill-port|pkill|kill\s+|taskkill|Stop-Process|lsof\s+-ti)\b", re.I)
+STOP_RE = re.compile(r"\b(?:kill-port|pkill|kill\s+|taskkill|Stop-Process|lsof\b)\b", re.I)
+# Inspection commands often mention vite/storybook/dev; never treat them as starts.
+DIAG_RE = re.compile(r"(?:^|[;&\n]|&&|\|\|)\s*(?:ps|pgrep|lsof|pkill|kill|kill-port|head|ls|rg|grep|cat|sed|awk|xargs)\b", re.I)
 
 
 def now() -> str:
@@ -153,14 +155,17 @@ def numbers_in_command(command: str) -> set[int]:
 
 
 def parse_port(command: str) -> int | None:
+    # Strip `ps -p <pid>` so short -p is not mistaken for a listen port.
+    cleaned = re.sub(r"\bps\s+-p\s+\d+\b", " ", command, flags=re.I)
     patterns = [
-        r"(?:--port|-p)\s*=?\s*([0-9]{2,5})\b",
-        r"\bPORT=([0-9]{2,5})\b",
-        r"localhost:([0-9]{2,5})\b",
-        r"127\.0\.0\.1:([0-9]{2,5})\b",
+        r"--port\s*=?\s*(\d{2,5})\b",
+        r"(?<!\w)-p\s*=?\s*(\d{2,5})\b",
+        r"\bPORT=(\d{2,5})\b",
+        r"localhost:(\d{2,5})\b",
+        r"127\.0\.0\.1:(\d{2,5})\b",
     ]
     for pattern in patterns:
-        match = re.search(pattern, command)
+        match = re.search(pattern, cleaned)
         if match:
             return int(match.group(1))
     return None
@@ -243,7 +248,9 @@ def learn_stop(workspace: Path, command_fingerprint: str) -> None:
 
 
 def seed_start(command: str) -> bool:
-    return bool(START_RE.search(command)) and not EXCLUDE_RE.search(command)
+    if DIAG_RE.search(command) or STOP_RE.search(command) or EXCLUDE_RE.search(command):
+        return False
+    return bool(START_RE.search(command))
 
 
 def stop_by_live_number(command: str, servers: dict[str, Any]) -> bool:
@@ -264,6 +271,8 @@ def is_stop_command(command: str, learned: dict[str, Any], servers: dict[str, An
 
 
 def is_start_command(command: str, learned: dict[str, Any]) -> bool:
+    if DIAG_RE.search(command) or STOP_RE.search(command):
+        return False
     command_fingerprint = fingerprint(command)
     return learned_start(learned, command_fingerprint) is not None or seed_start(command)
 
@@ -444,13 +453,10 @@ def launch_probe(workspace: Path, command: str, explicit_port: int | None, timeo
     )
 
 
-def open_probe_port(explicit_port: int | None, baseline_ports: set[int]) -> int | None:
+def open_probe_ports(explicit_port: int | None, baseline_ports: set[int]) -> list[int]:
     if explicit_port and port_open(explicit_port):
-        return explicit_port
-    for port in sorted(listening_ports() - baseline_ports):
-        if port_open(port):
-            return port
-    return None
+        return [explicit_port]
+    return [port for port in sorted(listening_ports() - baseline_ports) if port_open(port)]
 
 
 def probe(workspace: Path, token: str, timeout: int) -> int:
@@ -466,9 +472,11 @@ def probe(workspace: Path, token: str, timeout: int) -> int:
     while time.monotonic() < deadline:
         if not probe_active(workspace, command_fingerprint, token):
             return 0
-        port = open_probe_port(int(explicit_port) if explicit_port else None, baseline_ports)
-        if port:
-            finish_probe(workspace, command, port, token, "live")
+        ports = open_probe_ports(int(explicit_port) if explicit_port else None, baseline_ports)
+        if ports:
+            cancel_probe(workspace, command_fingerprint, token=token)
+            for port in ports:
+                set_live(workspace, command, port)
             return 0
         time.sleep(0.5)
     if probe_active(workspace, command_fingerprint, token):
@@ -528,18 +536,22 @@ def handle_before_shell(payload: dict[str, Any]) -> dict[str, Any]:
     prune_closed(workspace)
     learned = load_learned(workspace)
     servers = load_state(workspace)["servers"]
-    startish = is_start_command(command, learned)
-    if not startish and is_stop_command(command, learned, servers):
+    # Diagnostics never start. Explicit stop seeds win. Port-in-command alone does not
+    # outrank a real start like `pnpm dev --port 5173`.
+    if DIAG_RE.search(command):
         return {"permission": "allow"}
-    if not startish:
+    if STOP_RE.search(command) or learned_stop(learned, fingerprint(command)) is not None:
         return {"permission": "allow"}
-
-    conflict = conflict_server(workspace, command, learned)
-    if conflict and not is_restart(command):
-        return format_deny(conflict, command)
-    if conflict and is_restart(command):
-        remove_server(workspace, int(conflict["port"]))
-    launch_probe(workspace, command, parse_port(command))
+    if is_start_command(command, learned):
+        conflict = conflict_server(workspace, command, learned)
+        if conflict and not is_restart(command):
+            return format_deny(conflict, command)
+        if conflict and is_restart(command):
+            remove_server(workspace, int(conflict["port"]))
+        launch_probe(workspace, command, parse_port(command))
+        return {"permission": "allow"}
+    if stop_by_live_number(command, servers):
+        return {"permission": "allow"}
     return {"permission": "allow"}
 
 
@@ -580,9 +592,11 @@ def run_wrapped(argv: list[str]) -> int:
     deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
     try:
         while process.poll() is None and time.monotonic() < deadline:
-            port = open_probe_port(parse_port(command), baseline)
-            if port:
-                finish_probe(workspace, command, port, token, "live")
+            ports = open_probe_ports(parse_port(command), baseline)
+            if ports:
+                cancel_probe(workspace, fingerprint(command), token=token)
+                for port in ports:
+                    set_live(workspace, command, port)
                 break
             if not probe_active(workspace, fingerprint(command), token):
                 break

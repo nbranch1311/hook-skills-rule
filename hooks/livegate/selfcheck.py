@@ -18,6 +18,7 @@ from livegate import (
     learned_start,
     load_learned,
     load_state,
+    parse_port,
     port_open,
     seed_start,
     set_live,
@@ -39,6 +40,13 @@ def main() -> int:
     assert seed_start("pnpm --filter docs storybook:app")
     assert not seed_start("pnpm build")
     assert not seed_start("pnpm build-storybook")
+    assert not seed_start("lsof -iTCP -sTCP:LISTEN | rg -i 'vite|storybook|5173'")
+    assert not seed_start("ps -p 1841,1842 -o pid,command; pgrep -fl 'vite|storybook|dev:vite'")
+    assert not seed_start("pkill -f 'pnpm (dev|storybook)'; lsof -nP -iTCP:5173,6006")
+    assert not seed_start("head -n 15 *.txt 2>/dev/null || ls -la")
+    assert parse_port("ps -p 1841,1842 -o pid,command") is None
+    assert parse_port("pnpm dev --port 5173") == 5173
+    assert parse_port("vite -p 6006") == 6006
 
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp).resolve()
@@ -76,6 +84,17 @@ def main() -> int:
             assert "Local:" in denied["user_message"]
             assert f"http://localhost:{weird_port}" in denied["user_message"]
             assert f"kill {os.getpid()}" in denied["user_message"]
+
+            assert (
+                handle_before_shell(
+                    {
+                        "hook_event_name": "beforeShellExecution",
+                        "command": f"lsof -iTCP -sTCP:LISTEN | rg -i 'storybook|{weird_port}'",
+                        "workspace_roots": [str(workspace)],
+                    }
+                )["permission"]
+                == "allow"
+            )
 
             set_live(workspace, f"pnpm dev --port {dev_port}", dev_port, pid=os.getpid())
             set_live(workspace, f"pnpm storybook --port {storybook_port}", storybook_port, pid=os.getpid())
