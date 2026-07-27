@@ -1,6 +1,6 @@
 ---
 status: active
-verified: 2026-07-26
+verified: 2026-07-27
 ---
 
 # Hooks, Skills, Rule
@@ -14,8 +14,8 @@ type.
 
 ## Hooks
 
-- [LiveGate](hooks/livegate/) — prevents agents from starting duplicate
-  development servers and keeps a small per-repository live-server registry.
+- [auto-format-prettier](hooks/auto-format-prettier/) — `afterFileEdit` hook
+  that runs Prettier on the edited file (best-effort, never blocks).
 
 ## License
 
