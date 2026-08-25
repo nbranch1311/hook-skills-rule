@@ -20,7 +20,11 @@ type.
 ## Skills
 
 - [teach-skill](skills/teach-skill/) — turns confirmed user feedback into a
-  versioned improvement to the active skill, with hidden history and restore.
+  versioned improvement to the active skill.
+- [version-skill](skills/version-skill/) — model-invoked version preparation,
+  promotion, history, comparison, and append-only restore for `teach-skill`.
+- [self-check](skills/self-check/) — model-invoked promotion gate for candidate
+  skill changes.
 - [demo-mode](skills/demo-mode/) — minimizes latency and narration during a
   live demonstration.
 - [prune-agent-file](skills/prune-agent-file/) — removes stale, duplicate, and

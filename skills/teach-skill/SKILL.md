@@ -1,6 +1,6 @@
 ---
 name: teach-skill
-description: Turn direct user feedback from a skill run into a confirmed, durable improvement to that skill. Use only when the user explicitly invokes /teach-skill to teach, inspect history, compare versions, or restore a prior version.
+description: Turn direct feedback from a skill run into a confirmed, versioned improvement to that skill.
 disable-model-invocation: true
 ---
 
@@ -14,7 +14,8 @@ Never convert ambiguous feedback into a permanent rule without confirming what w
 
 - Change one explicitly identified skill.
 - Treat the active skill as the only discoverable version.
-- Keep history outside every `skills/` directory in the version store created by `scripts/version_skill.py`.
+- Use `/version-skill` for candidate preparation, history, promotion, comparison, and restore.
+- Use `/self-check` to validate a candidate before promotion.
 - Do not read historical skill contents unless the user asks to compare or restore them.
 - Never weaken the target skill's purpose, authority boundary, safety rule, or explicit prohibition as an incidental lesson.
 - Do not create branches, commits, or pull requests.
@@ -83,21 +84,12 @@ For **Apply only to this task**, acknowledge the scope and change no files. For 
 
 ## 4. Prepare a candidate
 
-Resolve the target skill directory and this skill's `scripts/version_skill.py`.
+Invoke `/version-skill` to prepare a candidate for the target skill. It must:
 
-Run:
-
-```bash
-python3 <teach-skill-dir>/scripts/version_skill.py prepare <target-skill-dir>
-```
-
-The command snapshots an unversioned active skill as version 1 and returns a candidate path outside `skills/`. If a candidate already exists, stop and ask whether to continue that lesson or discard it. Never delete it implicitly.
-
-If the user chooses discard:
-
-```bash
-python3 <teach-skill-dir>/scripts/version_skill.py discard <target-skill-dir>
-```
+- Snapshot an unversioned active skill as version 1.
+- Put the candidate and history outside all `skills/` directories.
+- Return the candidate path.
+- Refuse to overwrite an existing candidate. Ask whether to continue or discard it.
 
 Edit only the candidate. Make the smallest change that teaches the confirmed lesson:
 
@@ -108,29 +100,14 @@ Edit only the candidate. Make the smallest change that teaches the confirmed les
 
 ## 5. Validate and activate
 
-Validate the candidate:
+Invoke `/self-check` with the active skill, candidate, confirmed lesson, and regression example. Promote only when it returns **PASS**.
 
-```bash
-python3 <teach-skill-dir>/scripts/version_skill.py validate <candidate-dir>
-python3 <teach-skill-dir>/scripts/version_skill.py diff <target-skill-dir>
-```
+Then invoke `/version-skill` to promote the candidate with the confirmed lesson and regression example. Promotion must:
 
-Confirm that:
-
-- The candidate expresses the agreed lesson.
-- The regression example now follows the intended behavior.
-- Existing purpose, boundaries, gates, and prohibitions remain intact.
-- No unrelated cleanup is included.
-
-Write the confirmed lesson and regression example to a temporary UTF-8 text file, then promote:
-
-```bash
-python3 <teach-skill-dir>/scripts/version_skill.py promote <target-skill-dir> \
-  --lesson-file <lesson-file> \
-  --example-file <example-file>
-```
-
-Promotion must fail without changing the active skill when validation fails.
+- Preserve the candidate as a new version.
+- Replace only the active skill.
+- Keep archived versions undiscoverable.
+- Fail without changing the active skill if activation cannot complete safely.
 
 Report:
 
@@ -146,13 +123,4 @@ State that the new version applies to future invocations. Follow the confirmed l
 
 ## History, comparison, and restore
 
-Only do these when the user explicitly requests them.
-
-```bash
-python3 <teach-skill-dir>/scripts/version_skill.py history <target-skill-dir>
-python3 <teach-skill-dir>/scripts/version_skill.py compare <target-skill-dir> <version-a> <version-b>
-python3 <teach-skill-dir>/scripts/version_skill.py restore <target-skill-dir> <version> \
-  --lesson "Restore version <version>"
-```
-
-Restoring creates a new version; it never rewinds or deletes history. After restore, only the newly restored active copy belongs in the discoverable skill directory.
+Only when the user explicitly asks, invoke `/version-skill` to show history, compare named versions, or restore one. Restoring creates a new version; it never rewinds or deletes history. After restore, only the newly restored active copy belongs in the discoverable skill directory.
