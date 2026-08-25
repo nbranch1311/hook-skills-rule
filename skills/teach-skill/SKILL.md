@@ -82,7 +82,17 @@ Offer exactly:
 
 Do not modify the active skill before the user selects **Apply permanently** or explicitly confirms a **Charter change**.
 
-For **Apply only to this task**, acknowledge the scope and change no files. For **Save as my preference**, use the host's user-scoped memory or instruction mechanism, report where it was saved, and leave the target skill unchanged.
+For **Apply only to this task**, acknowledge the scope and change no files.
+
+For **Save as my preference**:
+
+1. Ask where it applies: this skill, this project, or all projects.
+2. If it applies only to this skill, reclassify it as a permanent skill lesson and return to the confirmation step.
+3. Otherwise inspect the live agent instruction files and rules at that scope. Update the existing canonical home instead of duplicating the preference.
+4. Use an always-loaded agent file for a short preference that should apply throughout the chosen scope. Use a conditional or path-scoped agent rule when it applies only in named situations or files.
+5. If no suitable home exists, create the smallest agent file or rule supported by the host.
+6. Show the exact wording and destination, then wait for confirmation before writing.
+7. Report where it was saved. Leave the target skill unchanged.
 
 ## 4. Prepare a candidate
 
