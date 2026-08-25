@@ -1,6 +1,6 @@
 ---
 status: active
-verified: 2026-07-27
+verified: 2026-08-25
 ---
 
 # Hooks, Skills, Rule
@@ -16,6 +16,15 @@ type.
 
 - [auto-format-prettier](hooks/auto-format-prettier/) — `afterFileEdit` hook
   that runs Prettier on the edited file (best-effort, never blocks).
+
+## Skills
+
+- [teach-skill](skills/teach-skill/) — turns confirmed user feedback into a
+  versioned improvement to the active skill, with hidden history and restore.
+- [demo-mode](skills/demo-mode/) — minimizes latency and narration during a
+  live demonstration.
+- [prune-agent-file](skills/prune-agent-file/) — removes stale, duplicate, and
+  contradictory agent instructions without dropping unique rules.
 
 ## License
 
