@@ -10,6 +10,8 @@ Improve a user-owned skill from direct feedback. First correct the current work.
 
 Never convert ambiguous feedback into a permanent rule without confirming what was learned and its intended scope.
 
+Requires the companion model-invoked skills `/version-skill` and `/self-check`. If either is unavailable, stop and ask the user to install the complete teach-skill suite; do not reproduce their workflows inline.
+
 ## Boundaries
 
 - Change one explicitly identified skill.
