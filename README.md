@@ -1,6 +1,6 @@
 ---
 status: active
-verified: 2026-08-25
+verified: 2026-09-04
 ---
 
 # Hooks, Skills, Rule
@@ -30,6 +30,8 @@ Teach-skill suite — install all three:
 
 Other skills:
 
+- [agent-factory](skills/agent-factory/) — interviews for a project, global, or
+  named agent file, then creates or patches it.
 - [demo-mode](skills/demo-mode/) — minimizes latency and narration during a
   live demonstration.
 - [prune-agent-file](skills/prune-agent-file/) — removes stale, duplicate, and
