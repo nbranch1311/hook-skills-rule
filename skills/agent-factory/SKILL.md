@@ -10,17 +10,17 @@ disable-model-invocation: true
 
 Interview me relentlessly about every aspect of this agent file until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.
 
-Ask the questions one at a time, waiting for feedback on each question before continuing. Asking multiple questions at once is bewildering.
+Ask the questions one at a time, waiting for feedback on each question before continuing. Asking multiple questions at once is confusing and frustrating.
 
-If a _fact_ can be found by exploring the codebase, look it up rather than asking me. The _decisions_, though, are mine — put each one to me and wait for my answer.
+If a _fact_ can be found by exploring the harness or agent files, look it up rather than asking me. The _decisions_, though, are mine — put each one to me and wait for my answer.
 
 Do not write or edit the agent file until I confirm we have reached a shared understanding.
 
 ## Before the interview
 
-1. Ask: is this for a **project** agent file, a **global** agent file, or a **named/called** agent (invoked like a PR or code-review agent)?
-2. Named/called only: ask for a name, then one sentence for when it should be used. If a named-agent directory already exists, offer existing files as update targets. If none, ask where this host keeps them. Project and global files do not need a name.
-3. Detect existing instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, and any named-agent directory). Project default if none: `AGENTS.md`. Global and named: ask if the path is unknown. Do not assume a Cursor-only layout.
+1. Ask: is this for a **project** agent file, a **global** agent file, or a **named/called** agent which can be invoked?
+2. Named/called only: ask for a name, then a short 1-3 sentence description of the agent. If a named-agent directory already exists, offer existing files that closely match the description as update targets. If none, ask where this host keeps them. Project and global files do not need a name.
+3. Detect existing instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and any named-agent directory). Project and Global default if none: `AGENTS.md`. Global and named: ask, if the path is unknown, but check with the harness and environment first.
 
 ## Interview
 
@@ -37,7 +37,7 @@ Don't add more dimensions unless the session surfaces a real extra one.
 
 Split always-on agent instructions from scoped constraints. If a scoped-instruction directory already exists, recommend writing overflow there after I agree. If it does not, keep a one-line "when in `path/`" bullet in the agent file. Never create a product-specific rules tree just to park overflow.
 
-Stern budget: keep the agent file under 200 lines. Going over risks agent bloat. Over 200 only if I insist, and warn first.
+Stern budget: keep the agent file under 225 lines. Going over risks agent bloat. Over 225 only if I insist, and warn first.
 
 ## After we agree
 
