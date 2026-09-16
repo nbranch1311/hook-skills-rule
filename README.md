@@ -1,6 +1,6 @@
 ---
 status: active
-verified: 2026-09-08
+verified: 2026-09-16
 ---
 
 # Hooks, Skills, Rule
@@ -70,6 +70,8 @@ Other skills:
 
 - [agent-factory](skills/agent-factory/) — interviews for a project, global, or
   named agent file, then creates or patches it.
+- [catch-me-up](skills/catch-me-up/) — morning briefing of tracked repos,
+  worktrees, and enabled apps (Jira, calendars, mail, and similar).
 - [demo-mode](skills/demo-mode/) — minimizes latency and narration during a
   live demonstration.
 - [prune-agent-file](skills/prune-agent-file/) — removes stale, duplicate, and

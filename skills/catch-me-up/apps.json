@@ -1,0 +1,60 @@
+{
+  "apps": [
+    {
+      "id": "jira",
+      "label": "Jira",
+      "enabled": false,
+      "kind": "mcp",
+      "discover": ["jira", "atlassian"]
+    },
+    {
+      "id": "confluence",
+      "label": "Confluence",
+      "enabled": false,
+      "kind": "mcp",
+      "discover": ["confluence", "atlassian"]
+    },
+    {
+      "id": "azure-devops",
+      "label": "Azure DevOps",
+      "enabled": false,
+      "kind": "cli",
+      "cli": "az"
+    },
+    {
+      "id": "github",
+      "label": "GitHub",
+      "enabled": false,
+      "kind": "cli",
+      "cli": "gh"
+    },
+    {
+      "id": "google-calendar",
+      "label": "Google Calendar",
+      "enabled": false,
+      "kind": "mcp",
+      "discover": ["google-calendar", "calendar", "gcal"]
+    },
+    {
+      "id": "outlook",
+      "label": "Outlook",
+      "enabled": false,
+      "kind": "mcp",
+      "discover": ["outlook", "microsoft-365", "office"]
+    },
+    {
+      "id": "linear",
+      "label": "Linear",
+      "enabled": false,
+      "kind": "mcp",
+      "discover": ["linear"]
+    },
+    {
+      "id": "slack",
+      "label": "Slack",
+      "enabled": false,
+      "kind": "mcp",
+      "discover": ["slack"]
+    }
+  ]
+}
