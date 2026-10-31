@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Make it make sense</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.45 system-ui, sans-serif; margin: 0; }
+  header { padding: 16px 20px 8px; }
+  header p { margin: 0 0 8px; }
+  #reload { font-size: 14px; opacity: 0.8; }
+  .layout { display: grid; grid-template-columns: minmax(16rem, 22rem) 1fr; min-height: calc(100vh - 88px); }
+  nav { padding: 8px 12px 24px; }
+  nav h2 { font-size: 14px; margin: 16px 8px 8px; }
+  article { padding: 8px 24px 32px; }
+  button.step { display: block; width: 100%; margin: 2px 0; padding: 6px 8px; text-align: left; font: inherit; background: transparent; color: inherit; border: 1px solid transparent; border-radius: 6px; }
+  button.step[data-walk="here"] { border-color: currentColor; font-weight: 700; }
+  button.step[data-preview="true"] { text-decoration: underline; }
+  #step-anchor, #returns, #later, #copy-state { font-size: 14px; }
+  #go-to-phrase { width: 100%; max-width: 40rem; font: inherit; padding: 8px; }
+  #go-to { font: inherit; margin-top: 8px; padding: 6px 10px; }
+  @media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <p id="walk-title"></p>
+  <p id="reload">Reload after each chat turn. A click previews a step here. The walk continues in chat.</p>
+</header>
+<div class="layout">
+  <nav id="tree"></nav>
+  <article>
+    <p id="step-status"></p>
+    <h1 id="step-title"></h1>
+    <p id="step-anchor"></p>
+    <p id="step-description"></p>
+    <p id="returns"></p>
+    <p id="later"></p>
+    <label for="go-to-phrase">Phrase for chat</label>
+    <input id="go-to-phrase" type="text" readonly>
+    <button id="go-to" type="button">Copy go to</button>
+    <p id="copy-state"></p>
+  </article>
+</div>
+<script type="application/json" id="walk-session">
+{
+  "title": "Sample — replace this map",
+  "agreed": false,
+  "cursor": "1.1",
+  "traversal": null,
+  "later": [],
+  "sections": [
+    {
+      "id": "1",
+      "title": "Choose a store",
+      "summary": "Where the session lives.",
+      "agreed": false,
+      "steps": [
+        {
+          "id": "1.1",
+          "title": "Name the artifact",
+          "anchor": "README.md:1",
+          "description": "The walk is about one named artifact.",
+          "coverage": "ahead",
+          "note": "",
+          "action": "",
+          "precondition": "",
+          "taken": true,
+          "fork": null,
+          "steps": []
+        },
+        {
+          "id": "1.2",
+          "title": "Pick a guide surface",
+          "anchor": "not built",
+          "description": "One surface shows the route.",
+          "coverage": "ahead",
+          "note": "",
+          "action": "",
+          "precondition": "",
+          "taken": true,
+          "fork": [
+            {
+              "id": "1.2.a",
+              "title": "HTML guide",
+              "anchor": "skills/make-it-make-sense/guide.html:1",
+              "description": "The file in this skill.",
+              "coverage": "visited",
+              "note": "",
+              "action": "",
+              "precondition": "No graph tool is already in use.",
+              "taken": true,
+              "fork": null,
+              "steps": []
+            },
+            {
+              "id": "1.2.b",
+              "title": "Existing map tool",
+              "anchor": "not built",
+              "description": "A tool that can show the route, the current step, a description, and the other steps.",
+              "coverage": "ahead",
+              "note": "",
+              "action": "",
+              "precondition": "The user already pointed at a graph or map tool.",
+              "taken": false,
+              "fork": null,
+              "steps": []
+            }
+          ],
+          "steps": []
+        }
+      ]
+    }
+  ]
+}
+</script>
+<script id="walk-guide">
+(function (root) {
+  function eachStep(session, visit) {
+    function walk(step) {
+      visit(step);
+      (step.fork || []).forEach(walk);
+      (step.steps || []).forEach(walk);
+    }
+    (session.sections || []).forEach(function (section) {
+      (section.steps || []).forEach(walk);
+    });
+  }
+
+  function findStep(session, id) {
+    var found = null;
+    eachStep(session, function (step) {
+      if (step.id === id) found = step;
+    });
+    return found;
+  }
+
+  function openOptions(step) {
+    return (step.fork || []).filter(function (option) {
+      return option.coverage !== "visited" && option.coverage !== "waived";
+    });
+  }
+
+  function openReturns(session) {
+    var returns = [];
+    eachStep(session, function (step) {
+      var open = openOptions(step);
+      if (open.length) {
+        returns.push({
+          id: step.id,
+          open: open.map(function (option) { return option.id; }),
+        });
+      }
+    });
+    return returns;
+  }
+
+  function goToPhrase(step) {
+    return "go to " + step.id + " " + step.title;
+  }
+
+  function viewState(session, previewId) {
+    var id = previewId || session.cursor;
+    var step = findStep(session, id);
+    if (!step) throw new Error("missing step " + id);
+    return {
+      walkId: session.cursor,
+      previewId: step.id,
+      title: step.title,
+      anchor: step.anchor,
+      description: step.description,
+      phrase: goToPhrase(step),
+      returns: openReturns(session),
+    };
+  }
+
+  function onStepClick(session, stepId) {
+    var cursor = session.cursor;
+    var view = viewState(session, stepId);
+    if (session.cursor !== cursor) throw new Error("preview moved the walk cursor");
+    return view;
+  }
+
+  function stepLabel(step, cursor) {
+    var bits = [];
+    if (step.id === cursor) bits.push("here");
+    bits.push(step.coverage);
+    if (step.note) bits.push("note");
+    if (step.action) bits.push("action");
+    if (openOptions(step).length) bits.push("return");
+    return bits.join(" · ");
+  }
+
+  function mount(doc) {
+    var session = JSON.parse(doc.getElementById("walk-session").textContent);
+    var previewId = session.cursor;
+
+    function appendStep(parent, step, depth) {
+      var button = doc.createElement("button");
+      button.className = "step";
+      button.setAttribute("type", "button");
+      button.setAttribute("data-id", step.id);
+      if (step.id === session.cursor) button.setAttribute("data-walk", "here");
+      if (step.id === previewId) button.setAttribute("data-preview", "true");
+      button.style.paddingLeft = (12 + depth * 16) + "px";
+      button.textContent = step.id + " " + step.title + " (" + stepLabel(step, session.cursor) + ")";
+      button.addEventListener("click", function () {
+        previewId = step.id;
+        render();
+      });
+      parent.appendChild(button);
+      (step.fork || []).forEach(function (option) { appendStep(parent, option, depth + 1); });
+      (step.steps || []).forEach(function (child) { appendStep(parent, child, depth + 1); });
+    }
+
+    function render() {
+      var view = viewState(session, previewId);
+      var step = findStep(session, view.previewId);
+      doc.getElementById("walk-title").textContent = session.title;
+      doc.getElementById("step-status").textContent =
+        (view.previewId === view.walkId ? "Here" : "Preview") + " · " + step.coverage;
+      doc.getElementById("step-title").textContent = view.title;
+      doc.getElementById("step-anchor").textContent = view.anchor;
+      doc.getElementById("step-description").textContent = view.description;
+      doc.getElementById("go-to-phrase").value = view.phrase;
+      doc.getElementById("returns").textContent = view.returns.length
+        ? view.returns.map(function (item) {
+          return "Return point " + item.id + ": " + item.open.join(", ");
+        }).join("\n")
+        : "No open return point";
+      doc.getElementById("later").textContent = session.later && session.later.length
+        ? "Go deeper later: " + session.later.join(", ")
+        : "";
+      var tree = doc.getElementById("tree");
+      while (tree.firstChild) tree.removeChild(tree.firstChild);
+      session.sections.forEach(function (section) {
+        var heading = doc.createElement("h2");
+        heading.textContent = section.title;
+        tree.appendChild(heading);
+        section.steps.forEach(function (child) { appendStep(tree, child, 0); });
+      });
+    }
+
+    doc.getElementById("go-to").addEventListener("click", function () {
+      var phrase = doc.getElementById("go-to-phrase").value;
+      var state = doc.getElementById("copy-state");
+      var clipboard = doc.clipboard;
+      if (clipboard && clipboard.writeText) {
+        Promise.resolve(clipboard.writeText(phrase)).then(function () {
+          state.textContent = "Copied.";
+        }, function () {
+          state.textContent = "Select the phrase and copy it.";
+        });
+      } else {
+        state.textContent = "Select the phrase and copy it.";
+      }
+    });
+
+    render();
+    return { session: session };
+  }
+
+  // ponytail: file:// cannot send a click into chat. Preview stays local; the walk cursor updates when this file is reloaded after #walk-session is rewritten. Upgrade path: a local server that appends go-to lines for the next turn.
+  if (typeof document !== "undefined" && document.getElementById && document.getElementById("walk-session")) {
+    mount(document);
+  }
+
+  root.MakeItMakeSense = {
+    findStep: findStep,
+    openReturns: openReturns,
+    viewState: viewState,
+    onStepClick: onStepClick,
+    goToPhrase: goToPhrase,
+    mount: mount,
+  };
+})(typeof globalThis !== "undefined" ? globalThis : this);
+</script>
+</body>
+</html>

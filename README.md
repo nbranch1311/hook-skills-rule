@@ -74,6 +74,8 @@ Other skills:
   worktrees, and enabled apps (Jira, calendars, mail, and similar).
 - [demo-mode](skills/demo-mode/) — minimizes latency and narration during a
   live demonstration.
+- [make-it-make-sense](skills/make-it-make-sense/) — walks finished work until
+  the choices are understood, agreed, and checked for gaps.
 - [prune-agent-file](skills/prune-agent-file/) — removes stale, duplicate, and
   contradictory agent instructions without dropping unique rules.
 
